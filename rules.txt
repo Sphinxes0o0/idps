@@ -1,0 +1,27 @@
+# NIDS Rules File
+# Format: <id> <proto> <dst_port> "<content>" "<message>"
+# proto: 6=TCP, 17=UDP, 0=any
+# dst_port: 0=any port
+# content: substring to match in payload, empty = match all traffic on that proto/port
+
+# --- HTTP attacks ---
+1 6 80 "GET /evil" "Suspicious HTTP GET request"
+2 6 80 "/etc/passwd" "Directory traversal attempt"
+3 6 80 "cmd.exe" "Windows cmd execution via HTTP"
+4 6 80 "<script>" "XSS injection attempt"
+5 6 80 "UNION SELECT" "SQL injection attempt"
+
+# --- HTTPS (alert on any TLS to port 443 — no payload decryption) ---
+# 6 6 443 "" "TLS connection"
+
+# --- DNS ---
+7 17 53 "" "DNS query detected"
+
+# --- SSH brute-force indicator (any TCP to port 22) ---
+8 6 22 "" "SSH connection attempt"
+
+# --- Telnet (cleartext remote access, should be blocked) ---
+9 6 23 "" "Telnet connection — insecure protocol"
+
+# --- FTP ---
+10 6 21 "PASS " "FTP login password transmitted in cleartext"

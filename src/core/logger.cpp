@@ -7,7 +7,9 @@ namespace nids {
 
 std::atomic<LogLevel> g_log_level{LogLevel::INFO};
 
-static std::mutex s_log_mutex;
+// ---- Built-in stderr sink ---------------------------------------------------
+
+namespace {
 
 static const char* level_str(LogLevel lv) {
     switch (lv) {
@@ -31,10 +33,29 @@ static void timestamp(char* buf, size_t n) {
              tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ms);
 }
 
-void log_write(LogLevel lv, const char* tag, const char* fmt, ...) {
-    char ts[16];
-    timestamp(ts, sizeof(ts));
+struct StderrSink : public LogSink {
+    void write(LogLevel lv, const char* tag, const char* msg) override {
+        char ts[16];
+        timestamp(ts, sizeof(ts));
+        fprintf(stderr, "[%s][%s][%-10s] %s\n", level_str(lv), ts, tag, msg);
+    }
+};
 
+} // anonymous namespace
+
+// ---- Active sink (guarded by s_log_mutex) -----------------------------------
+
+static std::mutex              s_log_mutex;
+static std::shared_ptr<LogSink> s_sink = std::make_shared<StderrSink>();
+
+void log_set_sink(std::shared_ptr<LogSink> sink) {
+    std::lock_guard<std::mutex> lg(s_log_mutex);
+    s_sink = sink ? std::move(sink) : std::make_shared<StderrSink>();
+}
+
+// ---- Public API -------------------------------------------------------------
+
+void log_write(LogLevel lv, const char* tag, const char* fmt, ...) {
     char msg[512];
     va_list ap;
     va_start(ap, fmt);
@@ -42,7 +63,7 @@ void log_write(LogLevel lv, const char* tag, const char* fmt, ...) {
     va_end(ap);
 
     std::lock_guard<std::mutex> lg(s_log_mutex);
-    fprintf(stderr, "[%s][%s][%-10s] %s\n", level_str(lv), ts, tag, msg);
+    s_sink->write(lv, tag, msg);
 }
 
 void log_set_level(const std::string& name) {

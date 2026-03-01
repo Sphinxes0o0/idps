@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdio>
 #include <ctime>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -15,6 +16,21 @@ enum class LogLevel : int {
     ERR   = 4,   // avoid clash with errno macro ERROR
     OFF   = 5
 };
+
+// ---- Pluggable sink interface ------------------------------------------------
+// Implement this to redirect log output to spdlog, syslog, Android log, etc.
+struct LogSink {
+    virtual ~LogSink() = default;
+    // Called for every log message that passes the level filter.
+    // lv  : severity level
+    // tag : module tag string
+    // msg : fully-formatted message (no trailing newline)
+    virtual void write(LogLevel lv, const char* tag, const char* msg) = 0;
+};
+
+// Replace the active sink (pass nullptr to restore the built-in stderr sink).
+// Thread-safe: subsequent log_write() calls will use the new sink.
+void log_set_sink(std::shared_ptr<LogSink> sink);
 
 // ---- Global log level (change at runtime) -----------------------------------
 extern std::atomic<LogLevel> g_log_level;

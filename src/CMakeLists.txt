@@ -17,6 +17,17 @@ add_library(nids_core
 target_include_directories(nids_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nids_core PUBLIC pthread nlohmann_json::nlohmann_json)
 
+# Apply logger backend compile definitions and library linkage
+if(NIDS_LOGGER_BACKEND STREQUAL "syslog")
+    target_compile_definitions(nids_core PRIVATE LOGGER_BACKEND_SYSLOG)
+elseif(NIDS_LOGGER_BACKEND STREQUAL "android")
+    target_compile_definitions(nids_core PRIVATE LOGGER_BACKEND_ANDROID)
+    target_link_libraries(nids_core PRIVATE log)          # Android log library
+elseif(NIDS_LOGGER_BACKEND STREQUAL "nlog")
+    target_compile_definitions(nids_core PRIVATE LOGGER_BACKEND_NLOG)
+    target_link_libraries(nids_core PRIVATE spdlog::spdlog)
+endif()
+
 # Main executable
 add_executable(nids main.cpp)
 target_link_libraries(nids PRIVATE nids_core)

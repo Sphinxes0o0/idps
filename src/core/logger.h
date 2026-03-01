@@ -22,6 +22,10 @@ extern std::atomic<LogLevel> g_log_level;
 // Set level by name string (trace/debug/info/warn/error/off)
 void log_set_level(const std::string& name);
 
+// Initialise the logging subsystem (call once at startup).
+// ident: program identity used by syslog and as the spdlog logger name.
+void log_init(const std::string& ident = "nids");
+
 // ---- Internal write (thread-safe) -------------------------------------------
 void log_write(LogLevel lv, const char* tag, const char* fmt, ...)
     __attribute__((format(printf, 3, 4)));

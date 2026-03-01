@@ -39,6 +39,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# Logger backend selection
+# Values: stderr (default) | syslog | android | nlog
+set(NIDS_LOGGER_BACKEND "stderr" CACHE STRING "Logger backend: stderr | syslog | android | nlog")
+set_property(CACHE NIDS_LOGGER_BACKEND PROPERTY STRINGS stderr syslog android nlog)
+
+if(NIDS_LOGGER_BACKEND STREQUAL "nlog")
+    FetchContent_Declare(
+        spdlog
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG        v1.14.1
+    )
+    FetchContent_MakeAvailable(spdlog)
+endif()
+
 # Source modules --------------------------------------------------------------
 
 add_subdirectory(src)

@@ -1,9 +1,12 @@
 #pragma once
 #include "../core/stage.h"
+#include "net_headers.h"
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
 #include <atomic>
+#include <vector>
+#include <string>
 
 namespace nids {
 
@@ -19,6 +22,28 @@ struct FlowEntry {
     uint32_t pkt_count       = 0;
     uint32_t byte_count      = 0;
     bool     alerted         = false;  ///< Suppress duplicate events
+};
+
+enum class TrackType {
+    BY_SRC,
+    BY_DST
+};
+
+struct DdosRule {
+    int         sid = 0;
+    std::string msg;
+    
+    // Filter conditions (0 = any)
+    uint8_t     proto = 0;
+    uint32_t    src_ip = 0;  // Network byte order
+    uint32_t    dst_ip = 0;
+    uint16_t    src_port = 0;
+    uint16_t    dst_port = 0;
+    
+    // Threshold config
+    uint32_t    limit_count = 0;
+    uint32_t    limit_seconds = 0;
+    TrackType   track = TrackType::BY_SRC;
 };
 
 /**
@@ -43,8 +68,12 @@ public:
     bool init()                        override { return true; }
     bool process(PipelineContext& ctx)  override;
     std::string name() const           override { return "Detection"; }
-    void shutdown()                    override { flow_table_.clear(); }
+    void shutdown()                    override { 
+        flow_table_.clear(); 
+        rule_states_.clear();
+    }
 
+    bool load_rules(const std::string& path);
     size_t flow_count() const { return flow_table_.size(); }
 
 private:
@@ -53,6 +82,9 @@ private:
 
     // Keyed by PacketSlot::flow_hash (good enough for one-NIC pipeline)
     std::unordered_map<uint32_t, FlowEntry> flow_table_;
+
+    std::vector<DdosRule> rules_;
+    std::unordered_map<std::string, FlowEntry> rule_states_;
 };
 
 } // namespace nids

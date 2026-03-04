@@ -33,8 +33,14 @@ bool NidsApp::start() {
         inst.pipeline = std::make_unique<Pipeline>();
         inst.pipeline->add_stage(std::make_unique<PreprocessStage>());
         inst.pipeline->add_stage(std::make_unique<DecodeStage>());
-        inst.pipeline->add_stage(
-            std::make_unique<DetectionStage>(pcfg.ddos_pkt_threshold, pcfg.ddos_window_ms));
+        
+        auto* detection = new DetectionStage(pcfg.ddos_pkt_threshold, pcfg.ddos_window_ms);
+        if (!pcfg.ddos_rules_file.empty()) {
+            if (!detection->load_rules(pcfg.ddos_rules_file)) {
+                LOG_WARN("app", "failed to load DDoS rules from '%s'", pcfg.ddos_rules_file.c_str());
+            }
+        }
+        inst.pipeline->add_stage(std::unique_ptr<IStage>(detection));
 
         auto* matcher = new MatchingStage();
         if (!pcfg.rules_file.empty()) {

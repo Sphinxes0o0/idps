@@ -1,0 +1,2 @@
+alert tcp any any -> any 80 (msg:"HTTP Flood Test"; threshold: type limit, track by_src, count 5, seconds 2; sid:101;)
+alert udp any any -> any 53 (msg:"DNS Flood Test"; threshold: type limit, track by_dst, count 100, seconds 1; sid:102;)

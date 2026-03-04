@@ -28,7 +28,8 @@ struct PipelineConfig {
     size_t      queue_depth = 4096;
     uint32_t    ddos_pkt_threshold = 10000;
     uint32_t    ddos_window_ms     = 1000;
-    std::string rules_file;        ///< Optional path to rules file
+    std::string rules_file;        ///< Optional path to rules file (MatchingStage)
+    std::string ddos_rules_file;   ///< Optional path to DDoS/Snort rules file (DetectionStage)
     int         capture_cpu = -1;
     int         process_cpu = -1;
 };

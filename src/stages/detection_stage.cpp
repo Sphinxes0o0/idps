@@ -6,6 +6,7 @@
 #include <sstream>
 #include <arpa/inet.h>
 #include <algorithm>
+#include <cctype>
 
 namespace nids {
 
@@ -29,6 +30,48 @@ static std::string trim(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+static std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static bool parse_uint_key(const std::string& body,
+                           const std::string& key,
+                           uint32_t& out) {
+    std::stringstream ss(body);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = trim(to_lower(tok));
+        if (tok.rfind(key, 0) != 0) continue;
+
+        auto pos = tok.find(' ');
+        if (pos == std::string::npos || pos + 1 >= tok.size()) return false;
+        try {
+            out = static_cast<uint32_t>(std::stoul(tok.substr(pos + 1)));
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static void parse_track_key(const std::string& body, TrackType& track) {
+    std::stringstream ss(body);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = trim(to_lower(tok));
+        if (tok.rfind("track", 0) != 0) continue;
+        if (tok.find("by_dst") != std::string::npos) {
+            track = TrackType::BY_DST;
+        } else {
+            track = TrackType::BY_SRC;
+        }
+        return;
+    }
+}
+
 bool DetectionStage::load_rules(const std::string& path) {
     std::ifstream f(path);
     if (!f.is_open()) return false;
@@ -36,6 +79,10 @@ bool DetectionStage::load_rules(const std::string& path) {
     rules_.clear();
     std::string line;
     while (std::getline(f, line)) {
+        const auto comment_pos = line.find('#');
+        if (comment_pos != std::string::npos) {
+            line = line.substr(0, comment_pos);
+        }
         line = trim(line);
         if (line.empty() || line[0] == '#') continue;
 
@@ -45,6 +92,7 @@ bool DetectionStage::load_rules(const std::string& path) {
         
         ss >> action >> proto_str >> src_str >> sport_str >> arrow >> dst_str >> dport_str;
         if (action != "alert") continue;
+        if (arrow != "->") continue;
 
         DdosRule rule;
         
@@ -66,43 +114,53 @@ bool DetectionStage::load_rules(const std::string& path) {
         std::stringstream oss(opts_content);
         std::string token;
         bool has_threshold = false;
+        bool valid_threshold = false;
 
         // Naive split by ';'
         while(std::getline(oss, token, ';')) {
             token = trim(token);
             if (token.empty()) continue;
 
-            if (token.find("msg:") == 0) {
+            std::string lower_token = to_lower(token);
+
+            if (lower_token.find("msg:") == 0) {
                 // msg:"..."
                 size_t q1 = token.find('"');
                 size_t q2 = token.rfind('"');
                 if (q1 != std::string::npos && q2 > q1) {
                     rule.msg = token.substr(q1 + 1, q2 - q1 - 1);
                 }
-            } else if (token.find("sid:") == 0) {
+            } else if (lower_token.find("sid:") == 0) {
                  try { rule.sid = std::stoi(token.substr(4)); } catch(...) {}
-            } else if (token.find("threshold:") == 0) {
-                // threshold: type limit, track by_src, count 100, seconds 60
+            } else if (lower_token.find("threshold:") == 0 ||
+                       lower_token.find("detection_filter:") == 0 ||
+                       lower_token.find("rate_filter:") == 0) {
+                // threshold/detection_filter/rate_filter: track by_src|by_dst, count N, seconds S
                 has_threshold = true;
-                std::string t_body = token.substr(10);
-                std::stringstream tss(t_body);
-                std::string t_tok;
-                while (std::getline(tss, t_tok, ',')) {
-                    t_tok = trim(t_tok);
-                    if (t_tok.find("count") == 0) {
-                         try { rule.limit_count = std::stoi(t_tok.substr(6)); } catch(...) {} // "count "
-                    } else if (t_tok.find("seconds") == 0) {
-                         try { rule.limit_seconds = std::stoi(t_tok.substr(8)); } catch(...) {} // "seconds "
-                    } else if (t_tok.find("track") == 0) {
-                        if (t_tok.find("by_dst") != std::string::npos) rule.track = TrackType::BY_DST;
-                    }
+                const size_t colon = token.find(':');
+                if (colon == std::string::npos || colon + 1 >= token.size()) continue;
+                std::string body = trim(token.substr(colon + 1));
+
+                uint32_t count = 0;
+                uint32_t seconds = 0;
+                const bool has_count = parse_uint_key(body, "count", count);
+                const bool has_seconds = parse_uint_key(body, "seconds", seconds);
+                parse_track_key(body, rule.track);
+
+                if (has_count && has_seconds && count > 0 && seconds > 0) {
+                    rule.limit_count = count;
+                    rule.limit_seconds = seconds;
+                    valid_threshold = true;
                 }
             }
         }
 
-        if (has_threshold) {
-             rules_.push_back(rule);
-             LOG_INFO("detection", "Loaded DDoS rule sid:%d msg:'%s' limit:%d/%ds", rule.sid, rule.msg.c_str(), rule.limit_count, rule.limit_seconds);
+        if (has_threshold && valid_threshold) {
+            rules_.push_back(rule);
+            LOG_INFO("detection", "Loaded DDoS rule sid:%d msg:'%s' limit:%d/%ds",
+                     rule.sid, rule.msg.c_str(), rule.limit_count, rule.limit_seconds);
+        } else if (has_threshold) {
+            LOG_WARN("detection", "skip invalid DDoS rule line='%s'", line.c_str());
         }
     }
     return true;

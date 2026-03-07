@@ -7,6 +7,8 @@
 #include <cstring>
 #include <arpa/inet.h>
 #include <thread>
+#include <fstream>
+#include <cstdio>
 
 using namespace nids;
 
@@ -130,5 +132,63 @@ TEST(DDoSModuleTest, TrackBySrc) {
     EXPECT_TRUE(ctx.alert);
     // Check SID
     EXPECT_EQ(ctx.matched_rules[0], 101);
+}
+
+TEST(DDoSModuleTest, DetectionFilterSyntaxSupported) {
+    const char* rule_path = "/tmp/idps_ddos_detection_filter.rules";
+    {
+        std::ofstream out(rule_path);
+        out << "alert tcp any any -> any 80 (msg:\"HTTP Flood DF\"; detection_filter: track by_src, count 3, seconds 2; sid:201;)\n";
+    }
+
+    PacketPool pool(16, 2048);
+    PipelineContext ctx;
+    ctx.packet = pool.allocate();
+
+    DecodeStage decoder;
+    DetectionStage detector(1000, 1000);
+    ASSERT_TRUE(detector.load_rules(rule_path));
+
+    for (int i = 0; i < 2; ++i) {
+        simple_packet(ctx.packet, 0x0A000010, 0x0A000001, 4000 + i, 80, IPPROTO_TCP);
+        ctx.reset(ctx.packet);
+        decoder.process(ctx);
+        detector.process(ctx);
+        EXPECT_FALSE(ctx.alert);
+    }
+
+    simple_packet(ctx.packet, 0x0A000010, 0x0A000001, 4002, 80, IPPROTO_TCP);
+    ctx.reset(ctx.packet);
+    decoder.process(ctx);
+    detector.process(ctx);
+    EXPECT_TRUE(ctx.alert);
+
+    std::remove(rule_path);
+}
+
+TEST(DDoSModuleTest, InvalidThresholdRuleIgnored) {
+    const char* rule_path = "/tmp/idps_ddos_invalid.rules";
+    {
+        std::ofstream out(rule_path);
+        out << "alert tcp any any -> any 80 (msg:\"bad\"; threshold: track by_src, count 0, seconds 0; sid:301;)\n";
+    }
+
+    PacketPool pool(16, 2048);
+    PipelineContext ctx;
+    ctx.packet = pool.allocate();
+
+    DecodeStage decoder;
+    DetectionStage detector(1000, 1000);
+    ASSERT_TRUE(detector.load_rules(rule_path));
+
+    for (int i = 0; i < 10; ++i) {
+        simple_packet(ctx.packet, 0x0A000020, 0x0A000001, 5000 + i, 80, IPPROTO_TCP);
+        ctx.reset(ctx.packet);
+        decoder.process(ctx);
+        detector.process(ctx);
+        EXPECT_FALSE(ctx.alert);
+    }
+
+    std::remove(rule_path);
 }
 

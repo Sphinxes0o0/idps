@@ -252,6 +252,26 @@ static __always_inline int parse_packet(void *data, void *data_end,
 }
 
 /*
+ * 归一化流 key，确保 (A→B) 和 (B→A) 使用相同的 key
+ * 规则：src_ip <= dst_ip，如果相等则 src_port <= dst_port
+ */
+static __always_inline void normalize_flow_key(struct flow_key *key) {
+    /* 交换 IP 如果 src > dst */
+    if (key->src_ip > key->dst_ip) {
+        __u32 tmp_ip = key->src_ip;
+        key->src_ip = key->dst_ip;
+        key->dst_ip = tmp_ip;
+    }
+
+    /* 如果 IP 相等，交换端口 */
+    if (key->src_ip == key->dst_ip && key->src_port > key->dst_port) {
+        __u16 tmp_port = key->src_port;
+        key->src_port = key->dst_port;
+        key->dst_port = tmp_port;
+    }
+}
+
+/*
  * SYN flood 检测
  * 检查 TCP SYN 包，如果源 IP 发送大量 SYN 但无响应则判定为 flood
  * 返回: 0=正常, 1=flood detected
@@ -387,6 +407,9 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     if (key.protocol == IPPROTO_ICMP) {
         check_icmp_flood(key.src_ip);
     }
+
+    /* 归一化流 key，确保 (A→B) 和 (B→A) 使用同一 entry */
+    normalize_flow_key(&key);
 
     /* 更新流统计并检查 DDoS */
     int alert_sent = update_flow_stats(&key, pkt_len, bpf_ktime_get_ns());

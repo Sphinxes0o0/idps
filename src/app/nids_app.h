@@ -64,6 +64,12 @@ public:
 
     const std::shared_ptr<EventQueue>& event_queue() const { return event_queue_; }
 
+    /**
+     * @brief Reload rules from file (for SIGUSR1 / hot-reload)
+     * @return true if reload succeeded
+     */
+    bool reload_rules();
+
 protected:
     /**
      * @brief Factory to create the NIC instance.

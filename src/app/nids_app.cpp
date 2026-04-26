@@ -74,6 +74,83 @@ bool NidsApp::load_rules(const std::string& path, INic* nic,
     return true;
 }
 
+bool NidsApp::reload_rules() {
+    LOG_INFO("app", "reloading rules...");
+
+    int reloaded = 0;
+    for (auto& inst : instances_) {
+        // Get pipeline config (stored in cfg_ at same index)
+        size_t idx = &inst - &instances_[0];
+        if (idx >= cfg_.pipelines.size())
+            continue;
+
+        const auto& pcfg = cfg_.pipelines[idx];
+        if (pcfg.rules_file.empty())
+            continue;
+
+        // Re-parse rules
+        RuleParser parser;
+        RuleSet rs = parser.parse_file(pcfg.rules_file);
+        if (!parser.error().empty()) {
+            LOG_WARN("app", "rule reload parse warning: %s", parser.error().c_str());
+        }
+
+        // Push to kernel
+        auto* ebpf_nic = dynamic_cast<EbpfNic*>(inst.nic.get());
+        if (!ebpf_nic)
+            continue;
+
+        auto* loader = ebpf_nic->get_loader();
+        if (!loader)
+            continue;
+
+        // Push content rules
+        for (const auto& rule : rs.content_rules) {
+            RuleEntry entry;
+            entry.rule_id = static_cast<uint32_t>(rule.id);
+            entry.action = 2;
+            entry.severity = 1;
+            entry.protocol = rule.proto;
+            entry.dst_port = rule.dst_port;
+            entry.dpi_needed = 1;
+
+            if (loader->update_rule(entry)) {
+                reloaded++;
+            }
+        }
+
+        // Push simple rules
+        for (const auto& rule : rs.simple_rules) {
+            RuleEntry entry;
+            entry.rule_id = static_cast<uint32_t>(rule.id);
+            entry.action = 2;
+            entry.severity = 1;
+            entry.protocol = rule.proto;
+            entry.dst_port = rule.dst_port;
+            entry.dpi_needed = 0;
+
+            if (loader->update_rule(entry)) {
+                reloaded++;
+            }
+        }
+
+        // Update content rules for user-space BMH
+        inst.content_rules = std::move(rs.content_rules);
+
+        // Update AF_XDP rules if running
+        if (inst.xdp) {
+            std::vector<std::pair<std::string, int>> dpi_rules;
+            for (const auto& rule : inst.content_rules) {
+                dpi_rules.emplace_back(rule.content, static_cast<int>(rule.id));
+            }
+            inst.xdp->set_rules(dpi_rules);
+        }
+    }
+
+    LOG_INFO("app", "rules reloaded: %d rules updated", reloaded);
+    return true;
+}
+
 bool NidsApp::start() {
     // Shared event queue for all pipelines
     event_queue_ = std::make_shared<EventQueue>(65536);

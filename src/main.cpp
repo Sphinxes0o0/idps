@@ -14,6 +14,11 @@ static void on_signal(int sig) {
     std::exit(0);
 }
 
+static void on_sigusr1(int sig) {
+    std::cerr << "\n[NIDS] Received SIGUSR1 — reloading rules...\n";
+    if (g_app) g_app->reload_rules();
+}
+
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " <iface> [rules_file] [event_log] [log_level]\n"
@@ -43,6 +48,7 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);
+    std::signal(SIGUSR1, on_sigusr1);
 
     nids::NidsApp app(std::move(cfg));
     g_app = &app;

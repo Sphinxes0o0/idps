@@ -107,6 +107,7 @@ struct config_entry {
     __u32 ddos_threshold;
     __u32 window_size_ns;
     __u32 enabled;
+    __u32 drop_enabled;  /* 运行时可配置 */
 };
 
 /* 统计计数器索引 */

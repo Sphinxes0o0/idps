@@ -84,7 +84,7 @@ A high-performance Network Intrusion Detection System (NIDS) using XDP/eBPF for 
 
 **Actions**:
 - `action=0`: log only
-- `action=1`: drop (requires `drop_enabled=1` at compile time)
+- `action=1`: drop (requires `drop_enabled=1` at runtime via config map)
 - `action=2`: alert
 
 ### Event Types
@@ -169,8 +169,9 @@ docker run --rm -v $(pwd):/idps -w /idps ubuntu:22.04 bash -c \
 - Full BMH content matching on packet payload
 - Requires: kernel headers with `CONFIG_XDP_SOCKETS=y`
 
-### Runtime Drop Configuration (Planned)
-- BPF skeleton API for runtime `drop_enabled` control
+### Runtime Drop Configuration (Implemented)
+- `drop_enabled` is now runtime configurable via `config` map
+- Use `EbpfLoader::update_config()` to enable/disable drop at runtime
 
 ---
 

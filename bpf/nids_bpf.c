@@ -25,9 +25,6 @@ const volatile __u32 enabled = 1;
 /* 全局规则匹配标志 */
 const volatile __u32 match_rules_enabled = 1;
 
-/* 全局 Drop 功能开关 (默认关闭，防止误杀) */
-const volatile __u32 drop_enabled = 0;
-
 /*
  * 静态内联函数
  */
@@ -41,6 +38,25 @@ static __always_inline void increment_stat(__u32 index, __u64 value) {
     __u64 *count = bpf_map_lookup_elem(&stats, &key);
     if (count)
         __sync_fetch_and_add(count, value);
+}
+
+/*
+ * 获取配置值 (从 config map)
+ */
+static __always_inline __u32 get_config_enabled(void) {
+    __u32 key = 0;
+    struct config_entry *cfg = bpf_map_lookup_elem(&config, &key);
+    if (cfg)
+        return cfg->enabled;
+    return 1;  /* 默认启用 */
+}
+
+static __always_inline __u32 get_config_drop_enabled(void) {
+    __u32 key = 0;
+    struct config_entry *cfg = bpf_map_lookup_elem(&config, &key);
+    if (cfg)
+        return cfg->drop_enabled;
+    return 0;  /* 默认关闭 drop */
 }
 
 /*
@@ -275,7 +291,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                           key.src_port, key.dst_port,
                           key.protocol, SEVERITY_MEDIUM,
                           rule_id, EVENT_DPI_REQUEST);
-            } else if (action == 1 && drop_enabled) {
+            } else if (action == 1 && get_config_drop_enabled()) {
                 /* Drop 动作：丢弃数据包并发送告警 */
                 send_alert(key.src_ip, key.dst_ip,
                           key.src_port, key.dst_port,

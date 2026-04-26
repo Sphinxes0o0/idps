@@ -416,6 +416,85 @@ static __always_inline int check_icmp_flood(__u32 src_ip) {
 }
 
 /*
+ * DNS Amplification 检测
+ * 跟踪 DNS 查询和响应，当响应字节数远大于查询时判定为放大攻击
+ * 返回: 0=正常, 1=amplification detected
+ */
+static __always_inline int check_dns_amplification(__u32 src_ip, __u32 dst_ip,
+                                                   __u16 src_port, __u16 dst_port,
+                                                   __u32 pkt_len) {
+    __u64 now = bpf_ktime_get_ns();
+
+    if (dst_port == 53 && src_port != 53) {
+        /* DNS 查询: 记录查询字节数 */
+        struct dns_query_key q_key = {
+            .src_ip = src_ip,
+            .dst_ip = dst_ip,
+        };
+        struct dns_query_stats *q_stats = bpf_map_lookup_elem(&dns_query_track, &q_key);
+
+        if (!q_stats) {
+            struct dns_query_stats new_q = {
+                .query_count = 1,
+                .query_bytes = pkt_len,
+                .last_seen = now,
+            };
+            bpf_map_update_elem(&dns_query_track, &q_key, &new_q, BPF_ANY);
+        } else {
+            if (now - q_stats->last_seen >= WINDOW_SIZE_NS) {
+                q_stats->query_count = 1;
+                q_stats->query_bytes = pkt_len;
+                q_stats->last_seen = now;
+            } else {
+                q_stats->query_count++;
+                q_stats->query_bytes += pkt_len;
+                q_stats->last_seen = now;
+            }
+        }
+    } else if (src_port == 53 && dst_port != 53) {
+        /* DNS 响应: 检查是否是放大攻击 */
+        struct dns_amp_key a_key = {
+            .victim_ip = dst_ip,
+        };
+        struct dns_amp_stats *a_stats = bpf_map_lookup_elem(&dns_amp_track, &a_key);
+
+        if (!a_stats) {
+            struct dns_amp_stats new_a = {
+                .response_bytes = pkt_len,
+                .query_bytes = 0,
+                .last_seen = now,
+                .alert_sent = 0,
+            };
+            bpf_map_update_elem(&dns_amp_track, &a_key, &new_a, BPF_ANY);
+        } else {
+            if (now - a_stats->last_seen >= WINDOW_SIZE_NS) {
+                a_stats->response_bytes = pkt_len;
+                a_stats->query_bytes = 0;
+                a_stats->last_seen = now;
+                a_stats->alert_sent = 0;
+            } else {
+                a_stats->response_bytes += pkt_len;
+                a_stats->last_seen = now;
+            }
+
+            /* 检测放大: 响应 > 10x 查询 (典型放大倍数) */
+            if (a_stats->query_bytes > 0 &&
+                a_stats->response_bytes > a_stats->query_bytes * 10 &&
+                !a_stats->alert_sent) {
+                send_alert(src_ip, dst_ip, src_port, dst_port,
+                           IPPROTO_UDP, SEVERITY_HIGH,
+                           0, EVENT_DNS_AMP);
+                increment_stat(STATS_DNS_AMP_ALERTS, 1);
+                a_stats->alert_sent = 1;
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
  * XDP 主程序
  */
 static __always_inline int handle_xdp(struct xdp_md *ctx) {
@@ -447,6 +526,12 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     /* ICMP flood 检测 */
     if (key.protocol == IPPROTO_ICMP) {
         check_icmp_flood(key.src_ip);
+    }
+
+    /* DNS Amplification 检测 */
+    if (key.protocol == IPPROTO_UDP) {
+        check_dns_amplification(key.src_ip, key.dst_ip,
+                                key.src_port, key.dst_port, pkt_len);
     }
 
     /* 归一化流 key，确保 (A→B) 和 (B→A) 使用同一 entry */

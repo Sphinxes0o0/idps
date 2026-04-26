@@ -560,13 +560,6 @@ static __always_inline int check_icmp_flood(__u32 src_ip);
  *   - This implementation handles small-to-medium reassemblies
  */
 
-/* Get current fragment count for this CPU */
-static __always_inline __u32 get_frag_count(void) {
-    __u32 key = 0;
-    __u32 *count = bpf_map_lookup_elem(&frag_count, &key);
-    return count ? *count : 0;
-}
-
 /*
  * Check if IPv4 packet is a fragment
  * Returns: fragment info in out parameters

@@ -105,6 +105,9 @@ std::string alert_to_string(const AlertEvent& event) {
         case EVENT_FLOW_THRESHOLD: event_type_str = "FLOW_THRESHOLD"; break;
         case EVENT_NEW_FLOW: event_type_str = "NEW_FLOW"; break;
         case EVENT_DPI_REQUEST: event_type_str = "DPI_REQUEST"; break;
+        case EVENT_SYN_FLOOD: event_type_str = "SYN_FLOOD"; break;
+        case EVENT_ICMP_FLOOD: event_type_str = "ICMP_FLOOD"; break;
+        case EVENT_DNS_AMP: event_type_str = "DNS_AMP"; break;
         default: event_type_str = "UNKNOWN"; break;
     }
 

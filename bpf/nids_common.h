@@ -30,6 +30,9 @@ enum event_type {
     EVENT_FLOW_THRESHOLD = 2,
     EVENT_NEW_FLOW = 3,
     EVENT_DPI_REQUEST = 4,  /* 需要用户态 DPI 检查的请求 */
+    EVENT_SYN_FLOOD = 5,    /* SYN flood detected */
+    EVENT_ICMP_FLOOD = 6,   /* ICMP flood detected */
+    EVENT_DNS_AMP = 7,      /* DNS amplification detected */
 };
 
 /* 告警严重级别 */
@@ -66,6 +69,37 @@ struct flow_stats {
     __u32 window_packets;    /* 当前窗口内的包数 */
     __u8  flags;
     __u8  padding[7];
+};
+
+/*
+ * src_track - 基于源 IP 的 DDoS 跟踪结构
+ * 用于 SYN flood 和 ICMP flood 检测
+ */
+struct src_track {
+    __u64 packet_count;     /* 窗口内的包计数 */
+    __u64 last_seen;        /* 最后包时间 */
+    __u64 window_start;     /* 窗口起始时间 */
+    __u8  flags;           /* 标志位 */
+    __u8  padding[7];
+};
+
+/*
+ * syn_flood_key - SYN flood 跟踪的 key
+ * 使用源 IP + 目标 IP + 目标端口追踪特定端口的 SYN flood
+ */
+struct syn_flood_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 dst_port;
+    __u8  padding[2];
+};
+
+/*
+ * icmp_flood_key - ICMP flood 跟踪的 key
+ * 只使用源 IP
+ */
+struct icmp_flood_key {
+    __u32 src_ip;
 };
 
 /*
@@ -118,6 +152,9 @@ enum stats_index {
     STATS_DDoS_ALERTS = 3,
     STATS_RULE_MATCHES = 4,
     STATS_NEW_FLOWS = 5,
+    STATS_SYN_FLOOD_ALERTS = 6,
+    STATS_ICMP_FLOOD_ALERTS = 7,
+    STATS_DNS_AMP_ALERTS = 8,
     STATS_MAX = 256,
 };
 
@@ -234,5 +271,21 @@ struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __uint(max_entries, 1);
 } xdp_jmp_table SEC(".maps");
+
+/* SYN flood 跟踪表 - LRU Hash (key = syn_flood_key) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct syn_flood_key);
+    __type(value, struct src_track);
+} syn_flood_track SEC(".maps");
+
+/* ICMP flood 跟踪表 - LRU Hash (key = source IP) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct icmp_flood_key);
+    __type(value, struct src_track);
+} icmp_flood_track SEC(".maps");
 
 #endif /* NIDS_COMMON_H */

@@ -186,18 +186,18 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
 }
 
 /*
- * 解析以太网 + IPv4 + TCP/UDP 头
+ * 解析以太网 + IPv4 + TCP/UDP/ICMP 头
  * 直接从 XDP 帧访问，不依赖 skb
  *
  * 返回值:
  *   0: 成功解析
  *  -1: 数据越界
  *  -2: 非 IPv4
- *  -3: 非 TCP/UDP
  */
 static __always_inline int parse_packet(void *data, void *data_end,
                                          struct flow_key *key,
-                                         __u32 *pkt_len) {
+                                         __u32 *pkt_len,
+                                         __u8 *tcp_flags) {
     struct ethhdr *eth;
     struct iphdr *ip;
     void *l4;
@@ -221,6 +221,9 @@ static __always_inline int parse_packet(void *data, void *data_end,
     key->protocol = ip->protocol;
     *pkt_len = bpf_ntohs(ip->tot_len);
 
+    /* 初始化 tcp_flags */
+    *tcp_flags = 0;
+
     /* 解析传输层 */
     l4 = (void *)(ip + 1);
     if (l4 > data_end)
@@ -232,6 +235,7 @@ static __always_inline int parse_packet(void *data, void *data_end,
             return -1;
         key->src_port = bpf_ntohs(tcp->source);
         key->dst_port = bpf_ntohs(tcp->dest);
+        *tcp_flags = *( (__u8 *)tcp + 13);  /* TCP flags 在 byte offset 13 */
     } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (struct udphdr *)l4;
         if ((void *)(udp + 1) > data_end)
@@ -248,6 +252,109 @@ static __always_inline int parse_packet(void *data, void *data_end,
 }
 
 /*
+ * SYN flood 检测
+ * 检查 TCP SYN 包，如果源 IP 发送大量 SYN 但无响应则判定为 flood
+ * 返回: 0=正常, 1=flood detected
+ */
+static __always_inline int check_syn_flood(__u32 src_ip, __u32 dst_ip,
+                                          __u16 dst_port, __u8 tcp_flags) {
+    /* 只检测 SYN flood (SYN=2, ACK=16) */
+    if (!(tcp_flags & 0x02) || (tcp_flags & 0x17)) {
+        /* 不是纯 SYN 包，忽略 */
+        return 0;
+    }
+
+    struct syn_flood_key s_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .dst_port = dst_port,
+    };
+    struct src_track *track = bpf_map_lookup_elem(&syn_flood_track, &s_key);
+    __u64 now = bpf_ktime_get_ns();
+
+    if (!track) {
+        /* 新条目 */
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&syn_flood_track, &s_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* 更新统计 */
+    if (now - track->window_start >= WINDOW_SIZE_NS) {
+        /* 重置窗口 */
+        track->window_start = now;
+        track->packet_count = 1;
+    } else {
+        track->packet_count++;
+    }
+    track->last_seen = now;
+
+    /* 检测阈值 */
+    if (track->packet_count >= ddos_threshold) {
+        /* 发送 SYN flood 告警 */
+        send_alert(src_ip, dst_ip, 0, dst_port,
+                   IPPROTO_TCP, SEVERITY_HIGH,
+                   0, EVENT_SYN_FLOOD);
+        increment_stat(STATS_SYN_FLOOD_ALERTS, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * ICMP flood 检测
+ * 检查 ICMP 包，如果源 IP 发送大量 ICMP 则判定为 flood
+ * 返回: 0=正常, 1=flood detected
+ */
+static __always_inline int check_icmp_flood(__u32 src_ip) {
+    struct icmp_flood_key i_key = {
+        .src_ip = src_ip,
+    };
+    struct src_track *track = bpf_map_lookup_elem(&icmp_flood_track, &i_key);
+    __u64 now = bpf_ktime_get_ns();
+
+    if (!track) {
+        /* 新条目 */
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&icmp_flood_track, &i_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* 更新统计 */
+    if (now - track->window_start >= WINDOW_SIZE_NS) {
+        /* 重置窗口 */
+        track->window_start = now;
+        track->packet_count = 1;
+    } else {
+        track->packet_count++;
+    }
+    track->last_seen = now;
+
+    /* 检测阈值 (ICMP flood 阈值可以低一些) */
+    if (track->packet_count >= ddos_threshold / 10) {
+        /* 发送 ICMP flood 告警 (阈值是 DDoS 的 1/10) */
+        send_alert(src_ip, 0, 0, 0,
+                   IPPROTO_ICMP, SEVERITY_MEDIUM,
+                   0, EVENT_ICMP_FLOOD);
+        increment_stat(STATS_ICMP_FLOOD_ALERTS, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
  * XDP 主程序
  */
 static __always_inline int handle_xdp(struct xdp_md *ctx) {
@@ -256,6 +363,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
 
     struct flow_key key = {};
     __u32 pkt_len = 0;
+    __u8 tcp_flags = 0;
     int ret;
 
     /* 检查是否启用 */
@@ -263,11 +371,21 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
 
     /* 解析数据包 */
-    ret = parse_packet(data, data_end, &key, &pkt_len);
+    ret = parse_packet(data, data_end, &key, &pkt_len, &tcp_flags);
     if (ret != 0) {
         /* 非支持协议，直接通过 */
         increment_stat(STATS_PACKETS_PASSED, 1);
         return XDP_PASS;
+    }
+
+    /* SYN flood 检测 (TCP with only SYN flag) */
+    if (key.protocol == IPPROTO_TCP) {
+        check_syn_flood(key.src_ip, key.dst_ip, key.dst_port, tcp_flags);
+    }
+
+    /* ICMP flood 检测 */
+    if (key.protocol == IPPROTO_ICMP) {
+        check_icmp_flood(key.src_ip);
     }
 
     /* 更新流统计并检查 DDoS */

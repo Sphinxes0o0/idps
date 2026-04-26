@@ -41,6 +41,9 @@ enum EventType {
     EVENT_FLOW_THRESHOLD = 2,
     EVENT_NEW_FLOW = 3,
     EVENT_DPI_REQUEST = 4,  /* 需要用户态 DPI 检查的请求 */
+    EVENT_SYN_FLOOD = 5,    /* SYN flood detected */
+    EVENT_ICMP_FLOOD = 6,   /* ICMP flood detected */
+    EVENT_DNS_AMP = 7,      /* DNS amplification detected */
 };
 
 /*

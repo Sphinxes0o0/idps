@@ -2,7 +2,9 @@
 #include "../core/logger.h"
 #include <pthread.h>
 #include <sched.h>
+#ifdef __x86_64__
 #include <immintrin.h>  // _mm_pause (x86) — graceful busy-wait
+#endif
 
 namespace nids {
 

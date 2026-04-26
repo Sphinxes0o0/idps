@@ -20,24 +20,95 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # Dependencies ----------------------------------------------------------------
 
-# GoogleTest (fetched at configure time, no pre-install needed)
-include(FetchContent)
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.14.0
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-set(BUILD_GMOCK OFF)
-FetchContent_MakeAvailable(googletest)
+# libbpf (system installed)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBBPF REQUIRED libbpf)
+# Also find bpf headers that might be in a different location
+find_path(LIBBPF_INCLUDE_DIR bpf/libbpf.h PATHS /usr/include /usr/include/bpf /usr/local/include)
 
-# nlohmann/json (header-only)
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
+# GoogleTest (system installed)
+find_package(GTest CONFIG)
+if(NOT GTest_FOUND)
+    # Fallback to FetchContent if system GTest not available
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK OFF)
+    FetchContent_MakeAvailable(googletest)
+endif()
+
+# nlohmann/json (header-only, system installed)
+find_package(nlohmann_json 3.10 CONFIG)
+if(NOT nlohmann_json_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
+# eBPF BPF Compiler ------------------------------------------------------------
+# Find clang for BPF target compilation
+find_program(CLANG_EXECUTABLE clang REQUIRED)
+message(STATUS "Found clang: ${CLANG_EXECUTABLE}")
+
+# Determine target architecture for BPF
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+    set(BPF_ARCH "x86")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    set(BPF_ARCH "arm64")
+else()
+    set(BPF_ARCH "x86")
+endif()
+message(STATUS "BPF target architecture: ${BPF_ARCH}")
+
+# Create bpf build directory
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bpf)
+
+# Custom command to compile BPF program
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o
+    COMMAND ${CLANG_EXECUTABLE}
+        -target bpf
+        -g
+        -O2
+        -Wall
+        -I${CMAKE_SOURCE_DIR}/bpf
+        -I${LIBBPF_INCLUDE_DIR}
+        -I/usr/include/bpf
+        -I/usr/include
+        -I/usr/include/aarch64-linux-gnu
+        -D__TARGET_ARCH_${BPF_ARCH}
+        -D__BPF_TRACING___
+        -c ${CMAKE_SOURCE_DIR}/bpf/nids_bpf.c
+        -o ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o
+    DEPENDS
+        ${CMAKE_SOURCE_DIR}/bpf/nids_bpf.c
+        ${CMAKE_SOURCE_DIR}/bpf/nids_common.h
+    COMMENT "Compiling eBPF program with clang"
+    VERBATIM
 )
-FetchContent_MakeAvailable(nlohmann_json)
+
+# Custom target for BPF (build with: make bpf)
+add_custom_target(bpf ALL
+    DEPENDS ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o
+    COMMENT "Building eBPF objects"
+)
+
+# Copy BPF object to known location for runtime loading
+add_custom_command(
+    TARGET bpf POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o
+        ${CMAKE_BINARY_DIR}/bin/nids_bpf.o
+    COMMENT "Copying BPF object to bin directory"
+)
 
 # Source modules --------------------------------------------------------------
 

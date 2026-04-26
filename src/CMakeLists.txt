@@ -3,6 +3,9 @@ add_library(nids_core
     core/logger.cpp
     ipc/event_queue.cpp
     nic/af_packet_nic.cpp
+    nic/ebpf_nic.cpp
+    ebpf/ebpf_loader.cpp
+    ebpf/ringbuf_reader.cpp
     stages/preprocess_stage.cpp
     stages/decode_stage.cpp
     stages/detection_stage.cpp
@@ -14,8 +17,18 @@ add_library(nids_core
     app/nids_app.cpp
 )
 
-target_include_directories(nids_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(nids_core PUBLIC pthread nlohmann_json::nlohmann_json)
+target_include_directories(nids_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBBPF_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/bpf
+)
+target_link_libraries(nids_core PUBLIC
+    pthread
+    nlohmann_json::nlohmann_json
+    /usr/lib/aarch64-linux-gnu/libbpf.a
+    elf
+    z
+)
 
 # Main executable
 add_executable(nids main.cpp)

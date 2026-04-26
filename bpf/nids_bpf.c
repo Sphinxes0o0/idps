@@ -162,6 +162,24 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
     /* 最多检查的规则数（避免 BPF verifier 抱怨无界循环）*/
     #define MAX_RULES_TO_CHECK 256
 
+    /* 首先尝试 hash 索引查找 O(1) */
+    struct rule_index_key idx_key = {
+        .proto_port = ((__u32)proto << 16) | dst_port,
+    };
+    __u32 *idx_rule_id = bpf_map_lookup_elem(&rule_index, &idx_key);
+    if (idx_rule_id) {
+        /* 找到索引，检查对应规则是否仍然匹配 */
+        struct rule_entry *rule = bpf_map_lookup_elem(&rules, idx_rule_id);
+        if (rule &&
+            (rule->protocol == 0 || rule->protocol == proto) &&
+            (rule->dst_port == 0 || rule->dst_port == dst_port)) {
+            return rule->rule_id | ((__u32)rule->dpi_needed << 31) | ((__u32)rule->action << 30);
+        }
+        /* 索引指向的规则已变更或不再匹配，删除无效索引 */
+        bpf_map_delete_elem(&rule_index, &idx_key);
+    }
+
+    /* 退回到线性扫描（处理 any 协议/端口规则） */
     for (__u32 i = 0; i < MAX_RULES_TO_CHECK; i++) {
         __u32 key = i;
         struct rule_entry *rule = bpf_map_lookup_elem(&rules, &key);
@@ -176,10 +194,10 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
         if (rule->dst_port != 0 && rule->dst_port != dst_port)
             continue;
 
-        /* 找到匹配！
-         * 返回 rule_id + dpi_needed (bit 31) + action (bit 30)
-         * action: 0=alert, 1=drop
-         */
+        /* 找到匹配！更新索引以加速下次查找 */
+        bpf_map_update_elem(&rule_index, &idx_key, &key, BPF_ANY);
+
+        /* 返回 rule_id + dpi_needed (bit 31) + action (bit 30) */
         return rule->rule_id | ((__u32)rule->dpi_needed << 31) | ((__u32)rule->action << 30);
     }
 

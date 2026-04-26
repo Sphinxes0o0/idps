@@ -191,6 +191,17 @@ bool EbpfLoader::update_rule(const RuleEntry& rule) {
         return false;
     }
 
+    /* 更新规则索引 (rule_index) 以加速内核查找 */
+    int idx_fd = get_map_fd("rule_index");
+    if (idx_fd >= 0) {
+        uint32_t idx_key = ((uint32_t)rule.protocol << 16) | rule.dst_port;
+        err = bpf_map_update_elem(idx_fd, &idx_key, &rule.rule_id, BPF_ANY);
+        if (err < 0) {
+            LOG_WARN("ebpf", "failed to update rule_index for rule %u", rule.rule_id);
+            /* 不影响主流程，继续 */
+        }
+    }
+
     LOG_DEBUG("ebpf", "updated rule %u", rule.rule_id);
     return true;
 }

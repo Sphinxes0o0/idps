@@ -331,4 +331,17 @@ struct {
     __type(value, struct dns_amp_stats);
 } dns_amp_track SEC(".maps");
 
+/* 规则索引 key: (protocol << 16) | dst_port */
+struct rule_index_key {
+    __u32 proto_port;  /* (protocol << 16) | port */
+};
+
+/* 规则索引: 加速 (protocol, port) -> rule_id 查找 */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct rule_index_key);
+    __type(value, __u32);  /* rule_id */
+} rule_index SEC(".maps");
+
 #endif /* NIDS_COMMON_H */

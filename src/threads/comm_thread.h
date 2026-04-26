@@ -23,11 +23,15 @@ public:
     /**
      * @param event_queue  Shared queue fed by EventStage.
      * @param log_path     File path for event JSON log. "-" = stdout.
+     * @param use_syslog   Also emit events to syslog.
      */
     CommThread(std::shared_ptr<EventQueue> event_queue,
-               std::string                 log_path = "-")
+               std::string                 log_path = "-",
+               bool                        use_syslog = false)
         : event_queue_(std::move(event_queue)),
-          log_path_(std::move(log_path)) {}
+          log_path_(std::move(log_path)),
+          use_syslog_(use_syslog) {
+    }
 
     ~CommThread() { stop(); }
 
@@ -45,6 +49,7 @@ private:
 
     std::shared_ptr<EventQueue> event_queue_;
     std::string                 log_path_;
+    bool                        use_syslog_ = false;
 
     std::atomic<bool> running_{false};
     std::thread       thread_;

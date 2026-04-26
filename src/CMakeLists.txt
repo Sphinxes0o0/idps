@@ -9,6 +9,8 @@ add_library(nids_core
     rules/rule_parser.cpp
     app/nids_app.cpp
     xdp/af_xdp.cpp  # Requires linux/if_xdp.h (CONFIG_XDP_SOCKETS kernel)
+    metrics/prometheus_server.cpp
+    metrics/metrics_registry.cpp
 )
 
 target_include_directories(nids_core PUBLIC

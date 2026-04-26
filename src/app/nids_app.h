@@ -4,11 +4,16 @@
 #include "../threads/comm_thread.h"
 #include "../rules/rule_parser.h"
 #include "../xdp/af_xdp.h"
+#include "../metrics/prometheus_server.h"
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace nids {
+
+// Forward declaration for config loading
+struct AppConfig;
+AppConfig load_config(const std::string& path);
 
 /**
  * @brief Configuration for one NIC → pipeline instance.
@@ -26,6 +31,8 @@ struct PipelineConfig {
 struct AppConfig {
     std::vector<PipelineConfig> pipelines;
     std::string event_log = "-";  ///< "-" = stdout
+    bool use_syslog = false;      ///< Also emit events to syslog
+    uint16_t metrics_port = 0;   ///< Prometheus metrics port (0 = disabled)
 };
 
 /**
@@ -86,6 +93,7 @@ private:
     AppConfig cfg_;
     std::shared_ptr<EventQueue>      event_queue_;
     std::unique_ptr<CommThread>     comm_thread_;
+    std::unique_ptr<PrometheusServer> prom_server_;
     std::vector<PipelineInstance>    instances_;
 };
 

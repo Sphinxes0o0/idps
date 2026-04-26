@@ -62,11 +62,21 @@ A high-performance Network Intrusion Detection System (NIDS) using XDP/eBPF for 
 
 ### Implemented
 
-- **DDoS Detection**: Sliding window per-flow packet counter + SYN flood + ICMP flood
-- **Rule Matching**: Proto/port based rule matching in kernel
-- **XDP Drop**: Blocking malicious traffic (action=drop)
-- **Rule File Parser**: Snort-like rule format support
-- **Event Logging**: JSON output to file or stdout
+- **eBPF/XDP Packet Processing**: Kernel-level packet processing with XDP/eBPF
+- **Kernel Rule Matching**: Proto/port based rule matching with port range support
+- **Hash-Indexed Rule Lookup**: O(1) rule lookup via kernel hash map
+- **SYN/ICMP Flood Detection**: Sliding window per-flow packet counter
+- **DNS Amplification Detection**: Detection of DNS amplification attacks
+- **DDoS Detection via LRU Flow Tracking**: Flow state management with LRU eviction
+- **User-Space BMH Content Matching**: Boyer-Moore-Horspool algorithm via AF_XDP
+- **BPF Ringbuf Zero-Copy Events**: Efficient event delivery from kernel to userspace
+- **BPF Skeleton Auto-Generation**: Compile-time BPF program generation
+- **Prometheus Metrics Server**: Metrics exposed on port 8080 (configurable)
+- **Syslog Logging**: System log integration
+- **Systemd Service + JSON Config**: Full systemd integration with JSON configuration
+- **Graceful Shutdown**: SIGINT/SIGTERM/SIGUSR1 signal handling
+- **libFuzzer Fuzz Test**: Built-in fuzzing support
+- **Tail Call XDP Pipeline Infrastructure**: Extensible XDP program chaining
 
 ### Rule Format
 
@@ -78,9 +88,14 @@ A high-performance Network Intrusion Detection System (NIDS) using XDP/eBPF for 
 |-------|--------|
 | `id` | Positive integer rule ID |
 | `proto` | `tcp`/`6`, `udp`/`17`, `any`/`0` |
-| `dst_port` | Port number or `any`/`0` |
+| `dst_port` | Port number, `port:port` range, or `any`/`0` |
 | `content` | Substring to match (empty = match all) |
 | `message` | Alert description |
+
+**Port Range Syntax**:
+- `80` - single port 80
+- `80:90` - port range (ports 80 through 90 inclusive)
+- `any` or `0` - any port
 
 **Actions**:
 - `action=0`: log only
@@ -93,7 +108,10 @@ A high-performance Network Intrusion Detection System (NIDS) using XDP/eBPF for 
 |------|-------------|
 | `0` | RULE_MATCH — Kernel rule matched |
 | `1` | DDOS — DDoS threshold exceeded |
+| `2` | FLOOD — SYN/ICMP flood detected |
+| `3` | DNS_AMP — DNS amplification attack detected |
 | `4` | DPI_REQUEST — Needs user-space content inspection |
+| `5` | BMH_MATCH — User-space BMH pattern match |
 
 ---
 
@@ -159,19 +177,6 @@ XDP/eBPF requires Linux. On macOS, verify the build using Docker:
 docker run --rm -v $(pwd):/idps -w /idps ubuntu:22.04 bash -c \
   'apt-get update > /dev/null 2>&1 && apt-get install -y cmake clang llvm libbpf-dev pkg-config make git libelf-dev > /dev/null 2>&1 && cmake -S . -B build && cmake --build build'
 ```
-
----
-
-## Future Enhancements
-
-### AF_XDP Support (Planned)
-- Zero-copy packet access from user space
-- Full BMH content matching on packet payload
-- Requires: kernel headers with `CONFIG_XDP_SOCKETS=y`
-
-### Runtime Drop Configuration (Implemented)
-- `drop_enabled` is now runtime configurable via `config` map
-- Use `EbpfLoader::update_config()` to enable/disable drop at runtime
 
 ---
 

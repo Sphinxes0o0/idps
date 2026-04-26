@@ -4,11 +4,50 @@
 #include "../ebpf/ringbuf_reader.h"
 #include "../utils/bmh_search.h"
 #include "../core/logger.h"
+#include "../metrics/metrics_registry.h"
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <fstream>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 namespace nids {
+
+AppConfig load_config(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        throw std::runtime_error("failed to open config file: " + path);
+    }
+    json j;
+    f >> j;
+
+    AppConfig cfg;
+    cfg.event_log = j.value("event_log", "-");
+    cfg.use_syslog = j.value("use_syslog", false);
+    cfg.metrics_port = j.value("metrics_port", 0);
+
+    if (j.contains("pipelines")) {
+        for (const auto& p : j["pipelines"]) {
+            PipelineConfig pcfg;
+            pcfg.iface = p.value("iface", "");
+            pcfg.rules_file = p.value("rules_file", "");
+            pcfg.ddos_threshold = p.value("ddos_threshold", 10000);
+            pcfg.capture_cpu = p.value("capture_cpu", -1);
+            cfg.pipelines.push_back(pcfg);
+        }
+    } else {
+        // Single pipeline mode (backward compatible)
+        PipelineConfig pcfg;
+        pcfg.iface = j.value("interface", j.value("iface", ""));
+        pcfg.rules_file = j.value("rules_file", "");
+        pcfg.ddos_threshold = j.value("ddos_threshold", 10000);
+        cfg.pipelines.push_back(pcfg);
+    }
+
+    return cfg;
+}
 
 std::unique_ptr<INic> NidsApp::make_nic(const std::string& /*iface*/) {
     return std::make_unique<EbpfNic>();
@@ -42,6 +81,7 @@ bool NidsApp::load_rules(const std::string& path, INic* nic,
                 entry.severity = 1;  // low
                 entry.protocol = rule.proto;
                 entry.dst_port = rule.dst_port;
+                entry.dst_port_max = rule.dst_port_max;
                 entry.dpi_needed = 1;  // 需要用户态 DPI
 
                 if (!loader->update_rule(entry)) {
@@ -57,6 +97,7 @@ bool NidsApp::load_rules(const std::string& path, INic* nic,
                 entry.severity = 1;  // low
                 entry.protocol = rule.proto;
                 entry.dst_port = rule.dst_port;
+                entry.dst_port_max = rule.dst_port_max;
                 entry.dpi_needed = 0;  // 内核直接匹配
 
                 if (!loader->update_rule(entry)) {
@@ -112,6 +153,7 @@ bool NidsApp::reload_rules() {
             entry.severity = 1;
             entry.protocol = rule.proto;
             entry.dst_port = rule.dst_port;
+            entry.dst_port_max = rule.dst_port_max;
             entry.dpi_needed = 1;
 
             if (loader->update_rule(entry)) {
@@ -127,6 +169,7 @@ bool NidsApp::reload_rules() {
             entry.severity = 1;
             entry.protocol = rule.proto;
             entry.dst_port = rule.dst_port;
+            entry.dst_port_max = rule.dst_port_max;
             entry.dpi_needed = 0;
 
             if (loader->update_rule(entry)) {
@@ -265,9 +308,23 @@ bool NidsApp::start() {
                  pcfg.rules_file.empty() ? "(none)" : pcfg.rules_file.c_str());
     }
 
-    // Communication thread - writes events to log
-    comm_thread_ = std::make_unique<CommThread>(event_queue_, cfg_.event_log);
+    // Communication thread - writes events to log (and syslog if enabled)
+    comm_thread_ = std::make_unique<CommThread>(event_queue_, cfg_.event_log, cfg_.use_syslog);
     comm_thread_->start();
+
+    // Prometheus metrics server
+    if (cfg_.metrics_port > 0) {
+        prom_server_ = std::make_unique<PrometheusServer>(cfg_.metrics_port);
+        prom_server_->set_collector([this]() {
+            auto& metrics = MetricsRegistry::instance();
+            if (comm_thread_) {
+                metrics.set_events_written(comm_thread_->events_written());
+            }
+            return metrics.collect();
+        });
+        prom_server_->start();
+        LOG_INFO("app", "Prometheus metrics server listening on port %u", cfg_.metrics_port);
+    }
 
     return true;
 }
@@ -297,6 +354,11 @@ void NidsApp::stop() {
     // Stop comm thread
     if (comm_thread_) {
         comm_thread_->stop();
+    }
+
+    // Stop Prometheus server
+    if (prom_server_) {
+        prom_server_->stop();
     }
 
     instances_.clear();

@@ -1,8 +1,15 @@
 # NIDS Rules File
 # Format: <id> <proto> <dst_port> "<content>" "<message>"
 # proto: 6=TCP, 17=UDP, 0=any
-# dst_port: 0=any port
+# dst_port: 0=any port, port:port=port range (e.g., 80:90)
 # content: substring to match in payload, empty = match all traffic on that proto/port
+
+# --- Port Range Examples ---
+# Match any TCP traffic on ports 80-90 (HTTP range)
+11 6 80:90 "" "HTTP port range traffic"
+
+# Match any UDP traffic on ports 10000-20000
+12 17 10000:20000 "" "High UDP port range traffic"
 
 # --- HTTP attacks ---
 1 6 80 "GET /evil" "Suspicious HTTP GET request"

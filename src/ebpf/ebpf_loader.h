@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <cstdint>
 
+// Forward declarations instead of including libbpf headers
 struct bpf_object;
 struct bpf_program;
 struct bpf_map;
@@ -33,13 +34,15 @@ struct NidsConfig {
 
 /*
  * 规则条目
+ * 支持单端口和端口范围
  */
 struct RuleEntry {
     uint32_t rule_id;
     uint8_t action;      // 0=log, 1=drop, 2=alert
     uint8_t severity;
     uint8_t protocol;    // 6=TCP, 17=UDP, 0=any
-    uint16_t dst_port;
+    uint16_t dst_port;   // 起始端口 (单端口或范围起始)
+    uint16_t dst_port_max; // 范围结束端口 (0 = 单端口)
     uint8_t dpi_needed; // 0=不需要, 1=需要用户态 DPI
 };
 

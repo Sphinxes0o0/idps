@@ -104,19 +104,39 @@ bool RuleParser::parse_line(const std::string& line, MatchRule& rule) {
     }
     rule.proto = parse_protocol(token);
 
-    // 3. 读取 dst_port
+    // 3. 读取 dst_port (支持范围格式: "80:90" 表示 80-90)
     if (!(iss >> token)) {
         error_ = "missing dst_port";
         return false;
     }
     if (token == "any" || token == "0") {
         rule.dst_port = 0;
+        rule.dst_port_max = 0;
     } else {
-        try {
-            rule.dst_port = static_cast<uint16_t>(std::stoi(token));
-        } catch (...) {
-            error_ = "invalid dst_port: " + token;
-            return false;
+        // 检查是否有范围分隔符 ":"
+        size_t colon_pos = token.find(':');
+        if (colon_pos != std::string::npos) {
+            // 端口范围格式: "80:90"
+            try {
+                rule.dst_port = static_cast<uint16_t>(std::stoi(token.substr(0, colon_pos)));
+                rule.dst_port_max = static_cast<uint16_t>(std::stoi(token.substr(colon_pos + 1)));
+            } catch (...) {
+                error_ = "invalid dst_port range: " + token;
+                return false;
+            }
+            if (rule.dst_port_max < rule.dst_port) {
+                error_ = "invalid port range (max < min): " + token;
+                return false;
+            }
+        } else {
+            // 单端口格式
+            try {
+                rule.dst_port = static_cast<uint16_t>(std::stoi(token));
+                rule.dst_port_max = 0;
+            } catch (...) {
+                error_ = "invalid dst_port: " + token;
+                return false;
+            }
         }
     }
 

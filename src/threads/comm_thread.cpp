@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include <memory>
+#include <syslog.h>
 
 namespace nids {
 
@@ -26,12 +27,28 @@ void CommThread::thread_func() {
         if (fout.is_open()) out = &fout;
     }
 
+    // Open syslog if enabled
+    if (use_syslog_) {
+        openlog("nids", LOG_PID | LOG_CONS, LOG_USER);
+    }
+
     while (running_.load(std::memory_order_acquire)) {
         auto maybe_ev = event_queue_->pop(200 /*ms*/);
         if (!maybe_ev) continue;
 
         *out << maybe_ev->to_json() << '\n';
         out->flush();
+
+        if (use_syslog_) {
+            int prio = LOG_INFO;
+            if (maybe_ev->type == SecEvent::Type::DDOS) {
+                prio = LOG_ERR;
+            } else if (maybe_ev->type == SecEvent::Type::RULE_MATCH) {
+                prio = LOG_WARNING;
+            }
+            syslog(prio, "%s", maybe_ev->to_json().c_str());
+        }
+
         ++events_written_;
     }
 
@@ -43,6 +60,10 @@ void CommThread::thread_func() {
         ++events_written_;
     }
     out->flush();
+
+    if (use_syslog_) {
+        closelog();
+    }
 }
 
 } // namespace nids

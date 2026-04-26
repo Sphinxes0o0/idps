@@ -10,6 +10,7 @@
 
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -122,15 +123,21 @@ struct alert_event {
 /*
  * rule_entry - 规则条目
  * 存储在 rules Map 中
+ *
+ * Port range support:
+ *   dst_port:     起始端口 (单端口或范围起始)
+ *   dst_port_max: 范围结束端口 (0 表示单端口)
+ *   当 dst_port_max > dst_port 时，表示范围匹配
  */
 struct rule_entry {
     __u32 rule_id;
     __u8  action;        /* 0=log, 1=drop, 2=alert */
     __u8  severity;
     __u8  protocol;      /* 6=TCP, 17=UDP, 0=any */
-    __u16 dst_port;
-    __u8  dpi_needed;    /* 0=不需要, 1=需要用户态 DPI */
-    __u8  padding[3];
+    __u16 dst_port;     /* 起始端口 (单端口或范围起始) */
+    __u16 dst_port_max; /* 范围结束端口 (0 = 单端口) */
+    __u8  dpi_needed;   /* 0=不需要, 1=需要用户态 DPI */
+    __u8  padding[2];
 };
 
 /*
@@ -266,11 +273,51 @@ struct {
     __uint(max_entries, 256 * 1024);  /* 256KB ring buffer */
 } events SEC(".maps");
 
-/* XDP 跳转表 (用于多程序链) */
+/*
+ * XDP Tail Call Pipeline
+ *
+ * Stage indices:
+ *   0 = PARSER   - Parse packet and extract 5-tuple
+ *   1 = DDOS     - SYN/ICMP flood detection
+ *   2 = DNS_AMP  - DNS amplification detection
+ *   3 = RULES    - Rule matching
+ *
+ * To enable tail call mode, populate xdp_jmp_table with program fds:
+ *   bpf_map_update_elem(map_fd, 0, parser_prog_fd, BPF_ANY);
+ *   bpf_map_update_elem(map_fd, 1, ddos_prog_fd, BPF_ANY);
+ *   bpf_map_update_elem(map_fd, 2, dns_amp_prog_fd, BPF_ANY);
+ *   bpf_map_update_elem(map_fd, 3, rules_prog_fd, BPF_ANY);
+ */
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 4);  /* 4 pipeline stages */
 } xdp_jmp_table SEC(".maps");
+
+/*
+ * Per-CPU context buffer for passing state between tail-called stages.
+ * Each stage reads from this buffer and writes intermediate results.
+ */
+struct xdp_pipeline_ctx {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  protocol;
+    __u8  ip_version;
+    __u32 pkt_len;
+    __u8  tcp_flags;
+    __u8  stage;         /* Current stage (0-3) */
+    __u8  action;        /* 0=pass, 1=drop, 2=alert */
+    __u32 rule_id;
+    __u8  verdict;       /* Final XDP verdict */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_pipeline_ctx);
+} xdp_ctx_buffer SEC(".maps");
 
 /* SYN flood 跟踪表 - LRU Hash (key = syn_flood_key) */
 struct {
@@ -343,5 +390,92 @@ struct {
     __type(key, struct rule_index_key);
     __type(value, __u32);  /* rule_id */
 } rule_index SEC(".maps");
+
+/*
+ * IP Defragmentation
+ *
+ * Fragment key: (src_ip, dst_ip, ip_id, protocol, ip_version)
+ * - IPv4: uses identification field (16-bit) from IP header
+ * - IPv6: uses identification field (32-bit) from Fragment header
+ */
+
+/*
+ * IPv6 Fragment Header (RFC 8200)
+ * Next Header: Protocol of the fragment
+ * Reserved: Reserved byte
+ * Fragment Offset: 13-bit offset in 8-byte units
+ * Res: Reserved 2 bits
+ * M Flag: 1 = more fragments, 0 = last fragment
+ * Identification: 32-bit identification value
+ */
+struct frag_hdr {
+    __u8    nexthdr;
+    __u8    reserved;
+    __u16    frag_off;       /* bits 0-12: offset, bits 13-14: reserved, bit 15: M flag */
+    __u32   identification;
+};
+
+/* Fragment tracking key */
+struct frag_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u32 ip_id;       /* IPv4: 16-bit identification extended to 32 */
+    __u8  protocol;    /* Next header protocol */
+    __u8  ip_version; /* 4 or 6 */
+    __u8  padding[2];
+};
+
+/* Fragment tracking value - stores metadata and fragment data */
+struct frag_entry {
+    __u64 first_seen;       /* Timestamp of first fragment */
+    __u64 last_seen;        /* Timestamp of last fragment */
+    __u32 total_length;     /* Total reassembled length (from first frag) */
+    __u32 received_length;  /* Currently received length */
+    __u16 fragment_count;  /* Number of fragments received */
+    __u8  more_fragments;  /* MF flag from first fragment (0=last, 1=more) */
+    __u8  complete;         /* Reassembly complete flag */
+    __u8  padding[2];
+    /* Fragment data stored inline after this structure */
+    /* Layout: [frag1_offset:16][frag1_size:16][frag1_data...] */
+};
+
+/* Fragment data buffer - stored separately due to size */
+struct frag_data {
+    __u32 session_id;      /* Index into frag_track */
+    __u16 offset;          /* Fragment offset in bytes */
+    __u16 size;            /* Fragment size in bytes */
+    __u8  padding[4];
+};
+
+/* Fragment tracking map - LRU hash to auto-evict old fragments */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);  /* Max concurrent reassemblies */
+    __type(key, struct frag_key);
+    __type(value, struct frag_entry);
+} frag_track SEC(".maps");
+
+/* Fragment data buffer map - stores actual fragment data */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);  /* Max 8K fragment buffers */
+    __type(key, __u32);         /* Buffer ID */
+    __type(value, struct frag_data);
+} frag_buffers SEC(".maps");
+
+/* Per-CPU fragment counter for limiting concurrent reassemblies */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} frag_count SEC(".maps");
+
+/* Defragmentation constants */
+#define FRAG_TIMEOUT_NS 30000000000ULL    /* 30 seconds timeout */
+#define FRAG_MAX_SIZE 65535               /* Max reassembled packet size */
+#define FRAG_MIN_SIZE 8                   /* Minimum fragment size (8-byte aligned) */
+#define FRAG_MAX_CONCURRENT 256           /* Max concurrent reassemblies per CPU */
+#define FRAG_BUFFER_SIZE 128              /* Size of each fragment buffer entry */
 
 #endif /* NIDS_COMMON_H */

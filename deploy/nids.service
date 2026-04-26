@@ -1,0 +1,37 @@
+[Unit]
+Description=IDPS - Intrusion Detection Prevention System
+Documentation=https://github.com/Sphinxes0o0/idps
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nids --config /etc/nids/nids.conf
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Run as unprivileged user (create 'nids' user and group)
+# User=nids
+# Group=nids
+
+# Allow binding to privileged ports (< 1024) and XDP
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/nids /etc/nids
+PrivateTmp=true
+
+# Logging
+SyslogIdentifier=nids
+SyslogFacility=local0
+
+# Shutdown timeout
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -25,7 +25,8 @@ struct MatchRule {
     std::string message;
     std::string content;     ///< 原始内容字符串（空=匹配所有）
     uint8_t     proto    = 0;   ///< 6=TCP, 17=UDP, 0=any
-    uint16_t    dst_port = 0;   ///< 目标端口（0=any）
+    uint16_t    dst_port = 0;   ///< 起始端口（0=any）
+    uint16_t    dst_port_max = 0; ///< 范围结束端口（0=单端口）
     bool        need_dpi = false; ///< 是否需要深度内容检查
 };
 

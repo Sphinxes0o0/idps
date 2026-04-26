@@ -15,6 +15,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <linux/ptrace.h>
+#include <linux/ipv6.h>
 
 /*
  * 全局配置 (从用户态更新)
@@ -207,48 +208,88 @@ static __always_inline int parse_packet(void *data, void *data_end,
     if ((void *)(eth + 1) > data_end)
         return -1;
 
-    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
-        return -2;
+    __u16 eth_proto = bpf_ntohs(eth->h_proto);
 
-    /* 解析 IPv4 */
-    ip = (struct iphdr *)(eth + 1);
-    if ((void *)(ip + 1) > data_end)
-        return -1;
-
-    /* 提取 5-tuple */
-    key->src_ip = bpf_ntohl(ip->saddr);
-    key->dst_ip = bpf_ntohl(ip->daddr);
-    key->protocol = ip->protocol;
-    *pkt_len = bpf_ntohs(ip->tot_len);
-
-    /* 初始化 tcp_flags */
-    *tcp_flags = 0;
-
-    /* 解析传输层 */
-    l4 = (void *)(ip + 1);
-    if (l4 > data_end)
-        return -1;
-
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (struct tcphdr *)l4;
-        if ((void *)(tcp + 1) > data_end)
+    if (eth_proto == ETH_P_IP) {
+        /* IPv4 */
+        ip = (struct iphdr *)(eth + 1);
+        if ((void *)(ip + 1) > data_end)
             return -1;
-        key->src_port = bpf_ntohs(tcp->source);
-        key->dst_port = bpf_ntohs(tcp->dest);
-        *tcp_flags = *( (__u8 *)tcp + 13);  /* TCP flags 在 byte offset 13 */
-    } else if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (struct udphdr *)l4;
-        if ((void *)(udp + 1) > data_end)
+
+        /* 提取 5-tuple */
+        key->src_ip = bpf_ntohl(ip->saddr);
+        key->dst_ip = bpf_ntohl(ip->daddr);
+        key->protocol = ip->protocol;
+        *pkt_len = bpf_ntohs(ip->tot_len);
+
+        /* 初始化 tcp_flags */
+        *tcp_flags = 0;
+
+        /* 解析传输层 */
+        l4 = (void *)(ip + 1);
+        if (l4 > data_end)
             return -1;
-        key->src_port = bpf_ntohs(udp->source);
-        key->dst_port = bpf_ntohs(udp->dest);
-    } else {
-        /* ICMP 等协议 */
-        key->src_port = 0;
-        key->dst_port = 0;
+
+        if (ip->protocol == IPPROTO_TCP) {
+            struct tcphdr *tcp = (struct tcphdr *)l4;
+            if ((void *)(tcp + 1) > data_end)
+                return -1;
+            key->src_port = bpf_ntohs(tcp->source);
+            key->dst_port = bpf_ntohs(tcp->dest);
+            *tcp_flags = *( (__u8 *)tcp + 13);
+        } else if (ip->protocol == IPPROTO_UDP) {
+            struct udphdr *udp = (struct udphdr *)l4;
+            if ((void *)(udp + 1) > data_end)
+                return -1;
+            key->src_port = bpf_ntohs(udp->source);
+            key->dst_port = bpf_ntohs(udp->dest);
+        } else {
+            key->src_port = 0;
+            key->dst_port = 0;
+        }
+
+        return 0;
+    } else if (eth_proto == ETH_P_IPV6) {
+        /* IPv6 — 暂不支持深度检测，记录统计后放行 */
+        struct ipv6hdr *ipv6 = (struct ipv6hdr *)(eth + 1);
+        if ((void *)(ipv6 + 1) > data_end)
+            return -1;
+
+        key->src_ip = 0;  /* IPv6 不兼容 IPv4 */
+        key->dst_ip = 0;
+        key->protocol = ipv6->nexthdr;
+        *pkt_len = bpf_ntohs(ipv6->payload_len);
+
+        /* 初始化 tcp_flags */
+        *tcp_flags = 0;
+
+        /* 解析传输层 (简化版，不处理扩展头) */
+        l4 = (void *)(ipv6 + 1);
+        if (l4 > data_end)
+            return -1;
+
+        if (ipv6->nexthdr == IPPROTO_TCP) {
+            struct tcphdr *tcp = (struct tcphdr *)l4;
+            if ((void *)(tcp + 1) > data_end)
+                return -1;
+            key->src_port = bpf_ntohs(tcp->source);
+            key->dst_port = bpf_ntohs(tcp->dest);
+            *tcp_flags = *( (__u8 *)tcp + 13);
+        } else if (ipv6->nexthdr == IPPROTO_UDP) {
+            struct udphdr *udp = (struct udphdr *)l4;
+            if ((void *)(udp + 1) > data_end)
+                return -1;
+            key->src_port = bpf_ntohs(udp->source);
+            key->dst_port = bpf_ntohs(udp->dest);
+        } else {
+            key->src_port = 0;
+            key->dst_port = 0;
+        }
+
+        return 0;
     }
 
-    return 0;
+    return -2;  /* 非 IPv4/IPv6 */
 }
 
 /*

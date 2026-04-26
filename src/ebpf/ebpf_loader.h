@@ -28,6 +28,7 @@ struct NidsConfig {
     uint32_t window_size_ns = 1000000000;
     bool enabled = true;
     bool match_rules_enabled = true;
+    bool drop_enabled = false;  // 是否启用 XDP drop 动作（默认关闭）
 };
 
 /*

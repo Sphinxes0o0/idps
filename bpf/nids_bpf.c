@@ -25,6 +25,9 @@ const volatile __u32 enabled = 1;
 /* 全局规则匹配标志 */
 const volatile __u32 match_rules_enabled = 1;
 
+/* 全局 Drop 功能开关 (默认关闭，防止误杀) */
+const volatile __u32 drop_enabled = 0;
+
 /*
  * 静态内联函数
  */
@@ -134,7 +137,9 @@ static __always_inline int update_flow_stats(struct flow_key *key,
  * 遍历规则表（最多检查 MAX_RULES_TO_CHECK 条），返回第一个匹配的 rule_id
  * 注意：这是 O(n) 扫描，生产环境建议用 proto+port 做 hash 索引
  *
- * @return rule_id | (dpi_needed << 31) 组合值
+ * @return rule_id | (dpi_needed << 31) | (action << 30)
+ *   dpi_needed: bit 31 = 1 表示需要用户态 DPI
+ *   action: bit 30 = 1 表示 drop, bit 30 = 0 表示 alert
  */
 static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
     /* 最多检查的规则数（避免 BPF verifier 抱怨无界循环）*/
@@ -154,10 +159,11 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
         if (rule->dst_port != 0 && rule->dst_port != dst_port)
             continue;
 
-        /* 找到匹配！返回 rule_id，如果有 dpi 标志则设置最高位 */
-        if (rule->dpi_needed)
-            return (1U << 31) | rule->rule_id;  /* DPI needed */
-        return rule->rule_id;
+        /* 找到匹配！
+         * 返回 rule_id + dpi_needed (bit 31) + action (bit 30)
+         * action: 0=alert, 1=drop
+         */
+        return rule->rule_id | ((__u32)rule->dpi_needed << 31) | ((__u32)rule->action << 30);
     }
 
     return 0;  /* 无匹配 */
@@ -259,8 +265,9 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     if (match_rules_enabled) {
         __u32 matched = match_simple_rules(key.protocol, key.dst_port);
         if (matched > 0) {
-            int dpi_needed = (matched >> 31) & 1;
-            __u32 rule_id = matched & 0x7FFFFFFF;
+            __u32 dpi_needed = (matched >> 31) & 1;
+            __u32 action = (matched >> 30) & 1;
+            __u32 rule_id = matched & 0x3FFFFFFF;  /* bits 0-29 */
 
             if (dpi_needed) {
                 /* 需要用户态 DPI 检查，发送 DPI_REQUEST 事件 */
@@ -268,8 +275,17 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                           key.src_port, key.dst_port,
                           key.protocol, SEVERITY_MEDIUM,
                           rule_id, EVENT_DPI_REQUEST);
+            } else if (action == 1 && drop_enabled) {
+                /* Drop 动作：丢弃数据包并发送告警 */
+                send_alert(key.src_ip, key.dst_ip,
+                          key.src_port, key.dst_port,
+                          key.protocol, SEVERITY_HIGH,
+                          rule_id, EVENT_RULE_MATCH);
+                increment_stat(STATS_RULE_MATCHES, 1);
+                increment_stat(STATS_PACKETS_DROPPED, 1);
+                return XDP_DROP;
             } else {
-                /* 内核直接匹配，发送 RULE_MATCH 事件 */
+                /* Alert 动作：发送告警但放行包 */
                 send_alert(key.src_ip, key.dst_ip,
                           key.src_port, key.dst_port,
                           key.protocol, SEVERITY_HIGH,

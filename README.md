@@ -62,7 +62,7 @@ A high-performance Network Intrusion Detection System (NIDS) using XDP/eBPF for 
 
 ### Implemented
 
-- **DDoS Detection**: Sliding window per-flow packet counter
+- **DDoS Detection**: Sliding window per-flow packet counter + SYN flood + ICMP flood
 - **Rule Matching**: Proto/port based rule matching in kernel
 - **XDP Drop**: Blocking malicious traffic (action=drop)
 - **Rule File Parser**: Snort-like rule format support

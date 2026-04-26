@@ -42,19 +42,49 @@ uint8_t parse_protocol(const std::string& s) {
     if (lower == "any" || lower == "0")
         return 0;
 
-    return 0;  // 默认 any
+    return 0;
+}
+
+// 从输入流中提取下一个带引号的字符串
+// 处理引号内包含空格的情况
+bool parse_quoted_string(std::istringstream& iss, std::string& result) {
+    char c;
+    // 跳过空白
+    while (iss.get(c) && std::isspace(c)) {}
+    if (!iss || c != '"') {
+        if (iss) iss.putback(c);
+        return false;
+    }
+
+    // 读取引号内的内容
+    result.clear();
+    while (iss.get(c)) {
+        if (c == '"') {
+            // 检查是否是转义的引号
+            if (iss.peek() == '"') {
+                iss.get(); // 读取下一个 "
+                result += '"';
+            } else {
+                // 正常的引号结束
+                return true;
+            }
+        } else {
+            result += c;
+        }
+    }
+    return false; // 引号未正确关闭
 }
 
 } // anonymous namespace
 
 bool RuleParser::parse_line(const std::string& line, MatchRule& rule) {
-    std::istringstream iss(line);
-    std::string token;
-
     // 跳过注释和空行
     std::string trimmed = trim(line);
     if (trimmed.empty() || trimmed[0] == '#')
         return false;
+
+    std::istringstream iss(trimmed);
+    std::string token;
 
     // 解析格式: <id> <proto> <dst_port> "<content>" "<message>"
     // 1. 读取 id
@@ -91,38 +121,15 @@ bool RuleParser::parse_line(const std::string& line, MatchRule& rule) {
     }
 
     // 4. 读取 content (带引号)
-    if (!(iss >> token)) {
-        error_ = "missing content";
-        return false;
-    }
-    // content 应该是 "..." 格式
-    if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
-        rule.content = token.substr(1, token.size() - 2);
-    } else if (token == "\"\"") {
-        rule.content = "";
-    } else {
-        error_ = "content must be quoted: " + token;
+    if (!parse_quoted_string(iss, rule.content)) {
+        error_ = "invalid content format";
         return false;
     }
 
     // 5. 读取 message (带引号)
-    if (!(iss >> token)) {
-        error_ = "missing message";
+    if (!parse_quoted_string(iss, rule.message)) {
+        error_ = "invalid message format";
         return false;
-    }
-    if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
-        rule.message = token.substr(1, token.size() - 2);
-    } else {
-        // 可能是没有引号的情况，读取剩余所有内容
-        rule.message = token;
-        std::string rest;
-        while (iss >> rest) {
-            rule.message += " " + rest;
-        }
-        // 去除可能的尾随引号
-        if (!rule.message.empty() && rule.message.back() == '"') {
-            rule.message.pop_back();
-        }
     }
 
     // 判断是否需要 DPI

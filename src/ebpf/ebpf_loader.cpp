@@ -160,6 +160,24 @@ int EbpfLoader::get_map_fd(const std::string& name) {
 }
 
 bool EbpfLoader::update_rule(const RuleEntry& rule) {
+    // Validate rule values to prevent BPF verifier issues and malicious injection
+    if (rule.action > 2) {
+        LOG_ERR("ebpf", "invalid rule action: %u (must be 0-2)", rule.action);
+        return false;
+    }
+    if (rule.severity > 4) {
+        LOG_ERR("ebpf", "invalid rule severity: %u (must be 0-4)", rule.severity);
+        return false;
+    }
+    if (rule.protocol != 0 && rule.protocol != 6 && rule.protocol != 17) {
+        LOG_ERR("ebpf", "invalid rule protocol: %u (must be 0, 6, or 17)", rule.protocol);
+        return false;
+    }
+    if (rule.dpi_needed > 1) {
+        LOG_ERR("ebpf", "invalid rule dpi_needed: %u (must be 0 or 1)", rule.dpi_needed);
+        return false;
+    }
+
     int rules_fd = get_map_fd("rules");
     if (rules_fd < 0) {
         LOG_ERR("ebpf", "rules map not available");

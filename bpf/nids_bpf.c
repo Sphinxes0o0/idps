@@ -79,7 +79,6 @@ static __always_inline int update_flow_stats(struct flow_key *key,
                                               __u32 pkt_len,
                                               __u64 now) {
     struct flow_stats *stats;
-    int is_new = 0;
     int alert_sent = 0;
 
     stats = bpf_map_lookup_elem(&conn_track, key);
@@ -99,7 +98,6 @@ static __always_inline int update_flow_stats(struct flow_key *key,
             return 0;
 
         increment_stat(STATS_NEW_FLOWS, 1);
-        is_new = 1;
     } else {
         /* 更新现有流 */
         stats->packet_count++;
@@ -132,17 +130,33 @@ static __always_inline int update_flow_stats(struct flow_key *key,
 /*
  * 简单规则匹配 (仅支持协议+端口快速过滤)
  * 复杂内容匹配保留在用户态 BMH
+ *
+ * 遍历规则表（最多检查 MAX_RULES_TO_CHECK 条），返回第一个匹配的 rule_id
+ * 注意：这是 O(n) 扫描，生产环境建议用 proto+port 做 hash 索引
  */
-static __always_inline int match_simple_rules(__u32 dst_ip,
-                                               __u16 dst_port,
-                                               __u8 proto) {
-    /* 遍历规则表进行匹配 (简化实现) */
-    /* 实际生产环境应使用 RCU lock 或更高效的查找 */
+static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
+    /* 最多检查的规则数（避免 BPF verifier 抱怨无界循环）*/
+    #define MAX_RULES_TO_CHECK 256
 
-    /* 这里仅演示概念: 实际需要根据规则 ID 遍历 */
-    /* 用户态应预先构建索引结构 */
+    for (__u32 i = 0; i < MAX_RULES_TO_CHECK; i++) {
+        __u32 key = i;
+        struct rule_entry *rule = bpf_map_lookup_elem(&rules, &key);
+        if (!rule)
+            break;  /* 规则不存在，终止扫描 */
 
-    return 0;
+        /* 检查协议匹配 (0=any) */
+        if (rule->protocol != 0 && rule->protocol != proto)
+            continue;
+
+        /* 检查端口匹配 (0=any port) */
+        if (rule->dst_port != 0 && rule->dst_port != dst_port)
+            continue;
+
+        /* 找到匹配！返回 rule_id */
+        return rule->rule_id;
+    }
+
+    return 0;  /* 无匹配 */
 }
 
 /*
@@ -161,7 +175,6 @@ static __always_inline int parse_packet(void *data, void *data_end,
     struct ethhdr *eth;
     struct iphdr *ip;
     void *l4;
-    __u8 proto;
 
     /* 解析 Ethernet */
     eth = (struct ethhdr *)data;
@@ -240,7 +253,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
 
     /* 简单规则匹配 (内核态) */
     if (match_rules_enabled) {
-        int matched = match_simple_rules(key.dst_ip, key.dst_port, key.protocol);
+        __u32 matched = match_simple_rules(key.protocol, key.dst_port);
         if (matched > 0) {
             send_alert(key.src_ip, key.dst_ip,
                       key.src_port, key.dst_port,

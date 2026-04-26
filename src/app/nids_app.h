@@ -2,6 +2,7 @@
 #include "../ipc/event_queue.hpp"
 #include "../nic/nic_interface.h"
 #include "../threads/comm_thread.h"
+#include "../rules/rule_parser.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@ struct PipelineConfig {
     std::string iface;             ///< Network interface name, e.g., "eth0"
     uint32_t    ddos_threshold = 10000;
     int         capture_cpu = -1;
+    std::string rules_file;        ///< Path to rules file (optional)
 };
 
 /**
@@ -30,6 +32,7 @@ struct AppConfig {
  */
 struct PipelineInstance {
     std::unique_ptr<INic>    nic;
+    std::vector<MatchRule>   content_rules;  ///< Rules needing BMH content matching
 };
 
 /**
@@ -67,9 +70,14 @@ protected:
     virtual std::unique_ptr<INic> make_nic(const std::string& iface);
 
 private:
+    /**
+     * @brief Load rules from file and push to kernel/user-space
+     */
+    bool load_rules(const std::string& path, INic* nic, std::vector<MatchRule>& content_rules);
+
     AppConfig cfg_;
     std::shared_ptr<EventQueue>      event_queue_;
-    std::unique_ptr<CommThread>      comm_thread_;
+    std::unique_ptr<CommThread>     comm_thread_;
     std::vector<PipelineInstance>    instances_;
 };
 

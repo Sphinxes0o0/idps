@@ -16,11 +16,12 @@ static void on_signal(int sig) {
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog
-              << " <iface> [event_log] [log_level]\n"
+              << " <iface> [rules_file] [event_log] [log_level]\n"
               << "  iface       - Network interface for XDP/eBPF (e.g., eth0)\n"
+              << "  rules_file  - Path to rules file [default: none]\n"
               << "  event_log   - Path to event log file, '-' for stdout [default: -]\n"
               << "  log_level   - trace/debug/info/warn/error/off [default: info]\n\n"
-              << "Example: " << prog << " eth0 /var/log/nids.json debug\n";
+              << "Example: " << prog << " eth0 rules.txt /var/log/nids.json debug\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -34,8 +35,9 @@ int main(int argc, char* argv[]) {
 
     pcfg.iface = argv[1];
 
-    if (argc >= 3) cfg.event_log = argv[2];
-    if (argc >= 4) nids::log_set_level(argv[3]);
+    if (argc >= 3) pcfg.rules_file = argv[2];
+    if (argc >= 4) cfg.event_log = argv[3];
+    if (argc >= 5) nids::log_set_level(argv[4]);
 
     cfg.pipelines.push_back(std::move(pcfg));
 

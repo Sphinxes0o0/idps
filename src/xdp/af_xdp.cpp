@@ -17,6 +17,8 @@
 #include <cstring>
 #include <errno.h>
 #include <net/if.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 namespace nids {
 

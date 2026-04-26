@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <atomic>
 
 struct xdp_socket;
 
@@ -124,7 +125,7 @@ private:
 
     int sock_fd_;
     bool opened_;
-    bool running_;
+    std::atomic<bool> running_;
 
     DpiCallback dpi_callback_;
     std::vector<std::pair<std::string, int>> rules_;  ///< (pattern, rule_id)

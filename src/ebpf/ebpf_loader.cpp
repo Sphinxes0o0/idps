@@ -113,11 +113,9 @@ bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bp
 
 void EbpfLoader::detach() {
     if (attached_ && ifindex_ > 0) {
-        // 卸载 XDP 程序 (使用 bpf_set_link_xdp_fd 兼容旧 API)
-        int err = bpf_set_link_xdp_fd(ifindex_, -1, 0);
-        if (err < 0) {
-            LOG_WARN("ebpf", "failed to detach XDP: %s", strerror(errno));
-        }
+        struct bpf_xdp_attach_opts opts = {};
+        opts.sz = sizeof(opts);
+        bpf_xdp_detach(ifindex_, 0, &opts);
         attached_ = false;
     }
 
@@ -246,11 +244,14 @@ bool EbpfLoader::attach_xdp() {
         return false;
     }
 
-    // 使用 bpf_set_link_xdp_fd 兼容旧版 libbpf
-    int err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE);
+    struct bpf_xdp_attach_opts opts = {};
+    opts.sz = sizeof(opts);
+    opts.old_prog_fd = -1;
+
+    int err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE, &opts);
     if (err < 0) {
-        // 尝试更宽松的模式
-        err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE);
+        LOG_ERR("ebpf", "bpf_xdp_attach failed, trying SKB mode");
+        err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE, &opts);
         if (err < 0) {
             LOG_ERR("ebpf", "failed to attach XDP: %s (try running as root)", strerror(errno));
             return false;

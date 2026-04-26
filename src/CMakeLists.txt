@@ -8,13 +8,14 @@ add_library(nids_core
     threads/comm_thread.cpp
     rules/rule_parser.cpp
     app/nids_app.cpp
-    # xdp/af_xdp.cpp  # Requires linux/if_xdp.h (CONFIG_XDP_SOCKETS kernel)
+    xdp/af_xdp.cpp  # Requires linux/if_xdp.h (CONFIG_XDP_SOCKETS kernel)
 )
 
 target_include_directories(nids_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${LIBBPF_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/bpf
+    /usr/include
 )
 target_link_libraries(nids_core PUBLIC
     pthread

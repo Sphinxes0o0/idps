@@ -3,6 +3,7 @@
 #include "../nic/nic_interface.h"
 #include "../threads/comm_thread.h"
 #include "../rules/rule_parser.h"
+#include "../xdp/af_xdp.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ struct AppConfig {
  */
 struct PipelineInstance {
     std::unique_ptr<INic>    nic;
+    std::unique_ptr<XdpProcessor> xdp;  ///< AF_XDP processor for user-space DPI
     std::vector<MatchRule>   content_rules;  ///< Rules needing BMH content matching
 };
 

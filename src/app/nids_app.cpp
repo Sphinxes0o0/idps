@@ -6,6 +6,7 @@
 #include "../core/logger.h"
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace nids {
 
@@ -136,6 +137,51 @@ bool NidsApp::start() {
             ebpf_nic->start_event_loop();
         }
 
+        // Set up AF_XDP for user-space DPI with BMH content matching
+        if (!inst.content_rules.empty()) {
+            inst.xdp = std::make_unique<XdpProcessor>();
+            XdpConfig xdp_cfg;
+            xdp_cfg.iface = pcfg.iface;
+            xdp_cfg.queue_id = pcfg.capture_cpu >= 0 ? static_cast<uint32_t>(pcfg.capture_cpu) : 0;
+
+            if (inst.xdp->open(xdp_cfg)) {
+                // Convert MatchRule to (pattern, rule_id) pairs for XdpProcessor
+                std::vector<std::pair<std::string, int>> dpi_rules;
+                for (const auto& rule : inst.content_rules) {
+                    dpi_rules.emplace_back(rule.content, static_cast<int>(rule.id));
+                }
+                inst.xdp->set_rules(dpi_rules);
+
+                // Set DPI callback to feed results into event queue
+                inst.xdp->set_dpi_callback([this](const XdpPacket& pkt, const DpiResult& result) {
+                    SecEvent sev;
+                    sev.timestamp = pkt.timestamp;
+                    sev.src_ip = pkt.src_ip;
+                    sev.dst_ip = pkt.dst_ip;
+                    sev.src_port = pkt.src_port;
+                    sev.dst_port = pkt.dst_port;
+                    sev.ip_proto = pkt.protocol;
+                    sev.rule_id = static_cast<uint32_t>(result.rule_id);
+                    sev.type = SecEvent::Type::RULE_MATCH;
+                    std::snprintf(sev.message, sizeof(sev.message),
+                                  "Rule %d matched (BMH): %s", result.rule_id, result.message.c_str());
+                    event_queue_->push(sev);
+                    LOG_DEBUG("app", "BMH match: rule %d src=%u:%u dst=%u:%u",
+                              result.rule_id, pkt.src_ip, pkt.src_port, pkt.dst_ip, pkt.dst_port);
+                });
+
+                // Start AF_XDP processing in background thread
+                std::thread xdp_thread([&inst]() {
+                    inst.xdp->run();
+                });
+                xdp_thread.detach();
+                LOG_INFO("app", "AF_XDP DPI started on iface='%s' with %zu content rules",
+                         pcfg.iface.c_str(), inst.content_rules.size());
+            } else {
+                LOG_WARN("app", "failed to open AF_XDP on iface='%s'", pcfg.iface.c_str());
+            }
+        }
+
         instances_.push_back(std::move(inst));
         LOG_INFO("app", "pipeline started on iface='%s' rules='%s'",
                  pcfg.iface.c_str(),
@@ -152,6 +198,11 @@ bool NidsApp::start() {
 void NidsApp::stop() {
     // Stop event loops first
     for (auto& inst : instances_) {
+        // Stop AF_XDP processor
+        if (inst.xdp) {
+            inst.xdp->stop();
+        }
+
         auto* ebpf_nic = dynamic_cast<EbpfNic*>(inst.nic.get());
         if (ebpf_nic) {
             ebpf_nic->stop_event_loop();

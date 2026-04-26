@@ -16,14 +16,11 @@ static void on_signal(int sig) {
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog
-              << " <iface> [ddos_threshold] [rules_file] [ddos_rules_file] [event_log] [log_level]\n"
-              << "  iface           - Network interface to capture (e.g., eth0)\n"
-              << "  ddos_threshold  - Packets/sec before DDoS alert [default: 10000]\n"
-              << "  rules_file      - Path to rules file for matching [default: none]\n"
-              << "  ddos_rules_file - Path to Snort rules file for DDoS [default: none]\n"
-              << "  event_log       - Path to event log file, '-' for stdout [default: -]\n"
-              << "  log_level       - trace/debug/info/warn/error/off [default: info]\n\n"
-              << "Example: " << prog << " eth0 5000 rules.txt ddos.rules /var/log/nids.json debug\n";
+              << " <iface> [event_log] [log_level]\n"
+              << "  iface       - Network interface for XDP/eBPF (e.g., eth0)\n"
+              << "  event_log   - Path to event log file, '-' for stdout [default: -]\n"
+              << "  log_level   - trace/debug/info/warn/error/off [default: info]\n\n"
+              << "Example: " << prog << " eth0 /var/log/nids.json debug\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -37,11 +34,8 @@ int main(int argc, char* argv[]) {
 
     pcfg.iface = argv[1];
 
-    if (argc >= 3) pcfg.ddos_pkt_threshold = static_cast<uint32_t>(std::atoi(argv[2]));
-    if (argc >= 4) pcfg.rules_file         = argv[3];
-    if (argc >= 5) pcfg.ddos_rules_file    = argv[4];
-    if (argc >= 6) cfg.event_log           = argv[5];
-    if (argc >= 7) nids::log_set_level(argv[6]);
+    if (argc >= 3) cfg.event_log = argv[2];
+    if (argc >= 4) nids::log_set_level(argv[3]);
 
     cfg.pipelines.push_back(std::move(pcfg));
 
@@ -51,11 +45,7 @@ int main(int argc, char* argv[]) {
     nids::NidsApp app(std::move(cfg));
     g_app = &app;
 
-    LOG_INFO("main", "Starting NIDS on interface '%s' (ddos_threshold=%s rules=%s log=%s)",
-             argv[1],
-             argc >= 3 ? argv[2] : "10000",
-             argc >= 4 ? argv[3] : "(none)",
-             argc >= 5 ? argv[4] : "-");
+    LOG_INFO("main", "Starting NIDS on interface '%s' (eBPF/XDP)", argv[1]);
 
     if (!app.start()) {
         LOG_ERR("main", "Startup failed.");

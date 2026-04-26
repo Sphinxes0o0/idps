@@ -1,13 +1,14 @@
 #include "nids_app.h"
-#include "../nic/af_packet_nic.h"
+#include "../nic/ebpf_nic.h"
+#include "../ebpf/ringbuf_reader.h"
 #include "../core/logger.h"
 #include <iostream>
 #include <stdexcept>
 
 namespace nids {
 
-std::unique_ptr<INic> NidsApp::make_nic() {
-    return std::make_unique<AfPacketNic>();
+std::unique_ptr<INic> NidsApp::make_nic(const std::string& /*iface*/) {
+    return std::make_unique<EbpfNic>();
 }
 
 bool NidsApp::start() {
@@ -18,55 +19,51 @@ bool NidsApp::start() {
     for (const auto& pcfg : cfg_.pipelines) {
         PipelineInstance inst;
 
-        // Memory
-        inst.pool  = std::make_unique<PacketPool>(pcfg.pool_slots, pcfg.slot_size);
-        inst.queue = std::make_unique<SPSCQueue<PacketSlot*>>(pcfg.queue_depth);
-
-        // NIC
-        inst.nic = make_nic();
+        // NIC (eBPF/XDP)
+        inst.nic = make_nic(pcfg.iface);
         if (!inst.nic->open(pcfg.iface)) {
             LOG_ERR("app", "failed to open NIC '%s'", pcfg.iface.c_str());
             return false;
         }
 
-        // Pipeline
-        inst.pipeline = std::make_unique<Pipeline>();
-        inst.pipeline->add_stage(std::make_unique<PreprocessStage>());
-        inst.pipeline->add_stage(std::make_unique<DecodeStage>());
-        
-        auto* detection = new DetectionStage(pcfg.ddos_pkt_threshold, pcfg.ddos_window_ms);
-        if (!pcfg.ddos_rules_file.empty()) {
-            if (!detection->load_rules(pcfg.ddos_rules_file)) {
-                LOG_WARN("app", "failed to load DDoS rules from '%s'", pcfg.ddos_rules_file.c_str());
-            }
+        // Set up alert callback to convert eBPF events to SecEvent
+        auto* ebpf_nic = dynamic_cast<EbpfNic*>(inst.nic.get());
+        if (ebpf_nic) {
+            ebpf_nic->set_alert_callback([this](const AlertEvent& event) {
+                SecEvent sev;
+                sev.timestamp = event.timestamp;
+                sev.src_ip = event.src_ip;
+                sev.dst_ip = event.dst_ip;
+                sev.src_port = event.src_port;
+                sev.dst_port = event.dst_port;
+                sev.ip_proto = event.protocol;
+                sev.rule_id = event.rule_id;
+
+                if (event.event_type == EVENT_DDoS_ALERT) {
+                    sev.type = SecEvent::Type::DDOS;
+                    std::snprintf(sev.message, sizeof(sev.message),
+                                  "DDoS alert: flow %08x packets exceeded threshold", event.src_ip);
+                } else if (event.event_type == EVENT_RULE_MATCH) {
+                    sev.type = SecEvent::Type::RULE_MATCH;
+                    std::snprintf(sev.message, sizeof(sev.message),
+                                  "Rule %u matched", event.rule_id);
+                } else {
+                    sev.type = SecEvent::Type::UNKNOWN;
+                }
+
+                event_queue_->push(sev);
+            });
+
+            // Start event loop to poll Ringbuf
+            ebpf_nic->start_event_loop();
         }
-        inst.pipeline->add_stage(std::unique_ptr<IStage>(detection));
-
-        auto* matcher = new MatchingStage();
-        if (!pcfg.rules_file.empty()) {
-            if (!matcher->load_rules(pcfg.rules_file)) {
-                LOG_WARN("app", "failed to load rules from '%s'", pcfg.rules_file.c_str());
-            }
-        }
-        inst.pipeline->add_stage(std::unique_ptr<IStage>(matcher));
-        inst.pipeline->add_stage(std::make_unique<EventStage>(event_queue_));
-
-        // Threads
-        inst.capture    = std::make_unique<CaptureThread>(
-            *inst.pool, *inst.queue, *inst.nic, pcfg.capture_cpu);
-        inst.processing = std::make_unique<ProcessingThread>(
-            *inst.pool, *inst.queue, *inst.pipeline, pcfg.process_cpu);
-
-        inst.processing->start();
-        inst.capture->start();
 
         instances_.push_back(std::move(inst));
-        LOG_INFO("app", "pipeline started on iface='%s' ddos_threshold=%u rules='%s'",
-                 pcfg.iface.c_str(), pcfg.ddos_pkt_threshold,
-                 pcfg.rules_file.empty() ? "(none)" : pcfg.rules_file.c_str());
+        LOG_INFO("app", "pipeline started on iface='%s' (eBPF/XDP)",
+                 pcfg.iface.c_str());
     }
 
-    // Communication thread
+    // Communication thread - writes events to log
     comm_thread_ = std::make_unique<CommThread>(event_queue_, cfg_.event_log);
     comm_thread_->start();
 
@@ -74,22 +71,31 @@ bool NidsApp::start() {
 }
 
 void NidsApp::stop() {
-    // Stop capture first (source of data)
+    // Stop event loops first
     for (auto& inst : instances_) {
-        if (inst.capture) inst.capture->stop();
+        auto* ebpf_nic = dynamic_cast<EbpfNic*>(inst.nic.get());
+        if (ebpf_nic) {
+            ebpf_nic->stop_event_loop();
+        }
+        if (inst.nic) {
+            inst.nic->close();
+        }
     }
-    // Then processing (drain remaining packets)
-    for (auto& inst : instances_) {
-        if (inst.processing) inst.processing->stop();
+
+    // Signal shutdown to event queue
+    if (event_queue_) {
+        event_queue_->signal_shutdown();
     }
-    // Finally comm thread
-    if (comm_thread_) comm_thread_->stop();
+
+    // Stop comm thread
+    if (comm_thread_) {
+        comm_thread_->stop();
+    }
 
     instances_.clear();
 }
 
 void NidsApp::wait() {
-    // Simple busy-wait; real impl would use sigwait / condition variable
     while (true) {
         struct timespec ts{1, 0};
         nanosleep(&ts, nullptr);

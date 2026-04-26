@@ -1,17 +1,7 @@
 #pragma once
-#include "../core/pool.hpp"
-#include "../core/spsc_queue.hpp"
-#include "../core/pipeline.h"
 #include "../ipc/event_queue.hpp"
 #include "../nic/nic_interface.h"
-#include "../threads/capture_thread.h"
-#include "../threads/processing_thread.h"
 #include "../threads/comm_thread.h"
-#include "../stages/preprocess_stage.h"
-#include "../stages/decode_stage.h"
-#include "../stages/detection_stage.h"
-#include "../stages/matching_stage.h"
-#include "../stages/event_stage.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,15 +13,8 @@ namespace nids {
  */
 struct PipelineConfig {
     std::string iface;             ///< Network interface name, e.g., "eth0"
-    size_t      pool_slots  = 16384;
-    size_t      slot_size   = 2048;
-    size_t      queue_depth = 4096;
-    uint32_t    ddos_pkt_threshold = 10000;
-    uint32_t    ddos_window_ms     = 1000;
-    std::string rules_file;        ///< Optional path to rules file (MatchingStage)
-    std::string ddos_rules_file;   ///< Optional path to DDoS/Snort rules file (DetectionStage)
+    uint32_t    ddos_threshold = 10000;
     int         capture_cpu = -1;
-    int         process_cpu = -1;
 };
 
 /**
@@ -46,12 +29,7 @@ struct AppConfig {
  * @brief Owns all resources for one NIC pipeline.
  */
 struct PipelineInstance {
-    std::unique_ptr<PacketPool>              pool;
-    std::unique_ptr<SPSCQueue<PacketSlot*>>  queue;
-    std::unique_ptr<Pipeline>                pipeline;
-    std::unique_ptr<INic>                    nic;
-    std::unique_ptr<CaptureThread>           capture;
-    std::unique_ptr<ProcessingThread>        processing;
+    std::unique_ptr<INic>    nic;
 };
 
 /**
@@ -84,9 +62,9 @@ public:
 protected:
     /**
      * @brief Factory to create the NIC instance.
-     * Overridden in tests to inject MockNic.
+     * Overridden in tests to inject mock.
      */
-    virtual std::unique_ptr<INic> make_nic();
+    virtual std::unique_ptr<INic> make_nic(const std::string& iface);
 
 private:
     AppConfig cfg_;

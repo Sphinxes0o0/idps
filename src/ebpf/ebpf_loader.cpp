@@ -79,7 +79,7 @@ bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bp
     }
 
     // 加载 BPF 对象
-    if (load_bpf_object(bpf_obj_path) < 0) {
+    if (!load_bpf_object(bpf_obj_path)) {
         return false;
     }
 
@@ -113,8 +113,8 @@ bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bp
 
 void EbpfLoader::detach() {
     if (attached_ && ifindex_ > 0) {
-        // 卸载 XDP 程序
-        int err = bpf_xdp_detach(ifindex_, 0, nullptr);
+        // 卸载 XDP 程序 (使用 bpf_set_link_xdp_fd 兼容旧 API)
+        int err = bpf_set_link_xdp_fd(ifindex_, -1, 0);
         if (err < 0) {
             LOG_WARN("ebpf", "failed to detach XDP: %s", strerror(errno));
         }
@@ -219,13 +219,11 @@ uint64_t EbpfLoader::get_stat(uint32_t index) {
         return 0;
     }
 
-    // stats 是 per-CPU array，需要遍历所有 CPU
-    uint64_t total = 0;
     uint32_t key = index;
+    uint64_t value = 0;
 
     // 简单起见，读取第一个 CPU 的值
     // 实际应遍历所有 CPU 并求和
-    uint64_t value = 0;
     int err = bpf_map_lookup_elem(stats_fd, &key, &value);
     if (err < 0) {
         return 0;
@@ -248,13 +246,11 @@ bool EbpfLoader::attach_xdp() {
         return false;
     }
 
-    struct bpf_xdp_attach_opts opts = {};
-    opts.sz = sizeof(opts);
-
-    int err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE, &opts);
+    // 使用 bpf_set_link_xdp_fd 兼容旧版 libbpf
+    int err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE);
     if (err < 0) {
         // 尝试更宽松的模式
-        err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE, &opts);
+        err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE);
         if (err < 0) {
             LOG_ERR("ebpf", "failed to attach XDP: %s (try running as root)", strerror(errno));
             return false;

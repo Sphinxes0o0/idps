@@ -9,8 +9,4 @@ endfunction()
 
 add_nids_test(test_pool)
 add_nids_test(test_queue)
-add_nids_test(test_stages)
-add_nids_test(test_pipeline)
-add_nids_test(test_integration)
-add_nids_test(test_ddos_module)
 add_nids_test(test_ebpf_loader)

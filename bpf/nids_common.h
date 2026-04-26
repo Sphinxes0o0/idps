@@ -29,6 +29,7 @@ enum event_type {
     EVENT_DDoS_ALERT = 1,
     EVENT_FLOW_THRESHOLD = 2,
     EVENT_NEW_FLOW = 3,
+    EVENT_DPI_REQUEST = 4,  /* 需要用户态 DPI 检查的请求 */
 };
 
 /* 告警严重级别 */
@@ -94,8 +95,8 @@ struct rule_entry {
     __u8  severity;
     __u8  protocol;      /* 6=TCP, 17=UDP, 0=any */
     __u16 dst_port;
-    __u32 padding;
-    /* 简单规则: 仅存储 IP 协议号和端口用于快速过滤 */
+    __u8  dpi_needed;    /* 0=不需要, 1=需要用户态 DPI */
+    __u8  padding[3];
 };
 
 /*

@@ -133,6 +133,8 @@ static __always_inline int update_flow_stats(struct flow_key *key,
  *
  * 遍历规则表（最多检查 MAX_RULES_TO_CHECK 条），返回第一个匹配的 rule_id
  * 注意：这是 O(n) 扫描，生产环境建议用 proto+port 做 hash 索引
+ *
+ * @return rule_id | (dpi_needed << 31) 组合值
  */
 static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
     /* 最多检查的规则数（避免 BPF verifier 抱怨无界循环）*/
@@ -152,7 +154,9 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
         if (rule->dst_port != 0 && rule->dst_port != dst_port)
             continue;
 
-        /* 找到匹配！返回 rule_id */
+        /* 找到匹配！返回 rule_id，如果有 dpi 标志则设置最高位 */
+        if (rule->dpi_needed)
+            return (1U << 31) | rule->rule_id;  /* DPI needed */
         return rule->rule_id;
     }
 
@@ -255,11 +259,23 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     if (match_rules_enabled) {
         __u32 matched = match_simple_rules(key.protocol, key.dst_port);
         if (matched > 0) {
-            send_alert(key.src_ip, key.dst_ip,
-                      key.src_port, key.dst_port,
-                      key.protocol, SEVERITY_HIGH,
-                      matched, EVENT_RULE_MATCH);
-            increment_stat(STATS_RULE_MATCHES, 1);
+            int dpi_needed = (matched >> 31) & 1;
+            __u32 rule_id = matched & 0x7FFFFFFF;
+
+            if (dpi_needed) {
+                /* 需要用户态 DPI 检查，发送 DPI_REQUEST 事件 */
+                send_alert(key.src_ip, key.dst_ip,
+                          key.src_port, key.dst_port,
+                          key.protocol, SEVERITY_MEDIUM,
+                          rule_id, EVENT_DPI_REQUEST);
+            } else {
+                /* 内核直接匹配，发送 RULE_MATCH 事件 */
+                send_alert(key.src_ip, key.dst_ip,
+                          key.src_port, key.dst_port,
+                          key.protocol, SEVERITY_HIGH,
+                          rule_id, EVENT_RULE_MATCH);
+                increment_stat(STATS_RULE_MATCHES, 1);
+            }
         }
     }
 

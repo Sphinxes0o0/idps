@@ -33,6 +33,22 @@ bool NidsApp::load_rules(const std::string& path, INic* nic,
     if (ebpf_nic) {
         auto* loader = ebpf_nic->get_loader();
         if (loader) {
+            // Push content rules with dpi_needed=1
+            for (const auto& rule : rs.content_rules) {
+                RuleEntry entry;
+                entry.rule_id = static_cast<uint32_t>(rule.id);
+                entry.action = 2;  // alert
+                entry.severity = 1;  // low
+                entry.protocol = rule.proto;
+                entry.dst_port = rule.dst_port;
+                entry.dpi_needed = 1;  // 需要用户态 DPI
+
+                if (!loader->update_rule(entry)) {
+                    LOG_WARN("app", "failed to push content rule %d to kernel", rule.id);
+                }
+            }
+
+            // Push simple rules with dpi_needed=0
             for (const auto& rule : rs.simple_rules) {
                 RuleEntry entry;
                 entry.rule_id = static_cast<uint32_t>(rule.id);
@@ -40,15 +56,18 @@ bool NidsApp::load_rules(const std::string& path, INic* nic,
                 entry.severity = 1;  // low
                 entry.protocol = rule.proto;
                 entry.dst_port = rule.dst_port;
+                entry.dpi_needed = 0;  // 内核直接匹配
 
                 if (!loader->update_rule(entry)) {
-                    LOG_WARN("app", "failed to push rule %d to kernel", rule.id);
+                    LOG_WARN("app", "failed to push simple rule %d to kernel", rule.id);
                 }
             }
         }
     }
 
     // Store content rules for user-space BMH matching
+    // Note: Currently DPI requires AF_XDP or separate packet capture
+    // This infrastructure is ready for future implementation
     content_rules = std::move(rs.content_rules);
 
     return true;
@@ -77,10 +96,7 @@ bool NidsApp::start() {
         // Set up alert callback to convert eBPF events to SecEvent
         auto* ebpf_nic = dynamic_cast<EbpfNic*>(inst.nic.get());
         if (ebpf_nic) {
-            // 保存 content_rules 引用用于 lambda
-            auto& rules = inst.content_rules;
-
-            ebpf_nic->set_alert_callback([this, &rules](const AlertEvent& event) {
+            ebpf_nic->set_alert_callback([this](const AlertEvent& event) {
                 SecEvent sev;
                 sev.timestamp = event.timestamp;
                 sev.src_ip = event.src_ip;
@@ -95,26 +111,20 @@ bool NidsApp::start() {
                     std::snprintf(sev.message, sizeof(sev.message),
                                   "DDoS alert: flow %08x packets exceeded threshold", event.src_ip);
                 } else if (event.event_type == EVENT_RULE_MATCH) {
-                    // 内核已匹配简单规则，检查是否需要 BMH 内容匹配
-                    bool matched = false;
-
-                    // 在内容规则中查找对应 rule_id
-                    for (const auto& rule : rules) {
-                        if (rule.id == static_cast<int>(event.rule_id)) {
-                            // 这是内核匹配的简单规则 (proto/port only)
-                            sev.type = SecEvent::Type::RULE_MATCH;
-                            std::snprintf(sev.message, sizeof(sev.message), "%s",
-                                          rule.message.c_str());
-                            matched = true;
-                            break;
-                        }
-                    }
-
-                    if (!matched) {
-                        sev.type = SecEvent::Type::RULE_MATCH;
-                        std::snprintf(sev.message, sizeof(sev.message),
-                                      "Rule %u matched", event.rule_id);
-                    }
+                    // 内核已匹配简单规则 (proto/port)
+                    sev.type = SecEvent::Type::RULE_MATCH;
+                    std::snprintf(sev.message, sizeof(sev.message),
+                                  "Rule %u matched (kernel)", event.rule_id);
+                } else if (event.event_type == EVENT_DPI_REQUEST) {
+                    // 需要用户态 DPI 检查
+                    // Note: 当前架构下无法获取 packet payload 进行 BMH 匹配
+                    // 需要 AF_XDP 或额外的数据包捕获机制
+                    sev.type = SecEvent::Type::RULE_MATCH;
+                    std::snprintf(sev.message, sizeof(sev.message),
+                                  "DPI requested for rule %u (payload unavailable)", event.rule_id);
+                    LOG_DEBUG("app", "DPI_REQUEST for rule %u src=%u:%u dst=%u:%u proto=%u",
+                              event.rule_id, event.src_ip, event.src_port,
+                              event.dst_ip, event.dst_port, event.protocol);
                 } else {
                     sev.type = SecEvent::Type::UNKNOWN;
                 }

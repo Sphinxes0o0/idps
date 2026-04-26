@@ -41,6 +41,7 @@ enum EventType {
     EVENT_DDoS_ALERT = 1,
     EVENT_FLOW_THRESHOLD = 2,
     EVENT_NEW_FLOW = 3,
+    EVENT_DPI_REQUEST = 4,  /* 需要用户态 DPI 检查的请求 */
 };
 
 /*

@@ -39,6 +39,7 @@ struct RuleEntry {
     uint8_t severity;
     uint8_t protocol;    // 6=TCP, 17=UDP, 0=any
     uint16_t dst_port;
+    uint8_t dpi_needed; // 0=不需要, 1=需要用户态 DPI
 };
 
 /*

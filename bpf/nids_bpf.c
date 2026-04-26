@@ -650,14 +650,7 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
 
     if (!entry) {
         /* No existing entry - this is first fragment */
-
-        /* Check if too many concurrent reassemblies */
-        __u32 current_count = get_frag_count();
-        if (current_count >= FRAG_MAX_CONCURRENT) {
-            /* Try to find and delete oldest entry */
-            increment_stat(STATS_PACKETS_DROPPED, 1);
-            return XDP_DROP;
-        }
+        /* LRU hash will handle eviction when capacity is reached */
 
         /* Create new tracking entry */
         struct frag_entry new_entry = {
@@ -829,13 +822,7 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
 
     if (!entry) {
         /* No existing entry - this is first fragment */
-
-        /* Check if too many concurrent reassemblies */
-        __u32 current_count = get_frag_count();
-        if (current_count >= FRAG_MAX_CONCURRENT) {
-            increment_stat(STATS_PACKETS_DROPPED, 1);
-            return XDP_DROP;
-        }
+        /* LRU hash will handle eviction when capacity is reached */
 
         /* Create new tracking entry */
         struct frag_entry new_entry = {

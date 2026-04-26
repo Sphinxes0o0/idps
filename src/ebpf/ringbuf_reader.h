@@ -3,7 +3,7 @@
  * ringbuf_reader.h - Ringbuf 事件读取器
  *
  * 从 eBPF Ringbuf 高效读取告警事件
- * 使用底層 bpf API 实现，不依赖 ringbuf.h
+ * 使用 libbpf ring_buffer API 实现
  */
 
 #pragma once
@@ -11,10 +11,9 @@
 #include <memory>
 #include <atomic>
 #include <cstdint>
-#include <sys/resource.h>
-#include <unistd.h>
+#include <bpf/libbpf.h>
 
-struct bpf_map;
+struct ring_buffer;
 
 namespace nids {
 
@@ -52,7 +51,7 @@ using AlertCallback = std::function<void(const AlertEvent& event)>;
 /*
  * RingbufReader - 读取 eBPF Ringbuf 中的告警事件
  *
- * 使用 epoll 轮询 ringbuf 文件描述符
+ * 使用 libbpf ring_buffer API 实现
  */
 class RingbufReader {
 public:
@@ -70,7 +69,7 @@ public:
 
     /*
      * 开始轮询事件
-     * @param timeout_ms 每次 poll 的超时时间 (毫秒)
+     * @param timeout_ms 每次 poll 的超时时间 (毫秒)，-1 表示阻塞
      * @note 此函数会阻塞，在 stop() 被调用前不会返回
      */
     void start(int timeout_ms = -1);
@@ -88,12 +87,13 @@ public:
     /*
      * 获取已处理事件计数
      */
-    uint64_t get_processed_count() const { return processed_count_; }
+    uint64_t get_processed_count() const { return processed_count_.load(); }
 
 private:
-    int epoll_fd_;
+    static int ringbuf_callback(void* ctx, void* data, size_t len);
+
+    struct ring_buffer* rb_ = nullptr;
     int map_fd_;
-    int ringbuf_fd_;
     AlertCallback callback_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> processed_count_{0};

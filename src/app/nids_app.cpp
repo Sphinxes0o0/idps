@@ -34,6 +34,7 @@ AppConfig load_config(const std::string& path) {
             pcfg.iface = p.value("iface", "");
             pcfg.rules_file = p.value("rules_file", "");
             pcfg.ddos_threshold = p.value("ddos_threshold", 10000);
+            pcfg.port_scan_threshold = p.value("port_scan_threshold", 20);
             pcfg.capture_cpu = p.value("capture_cpu", -1);
             cfg.pipelines.push_back(pcfg);
         }
@@ -43,6 +44,7 @@ AppConfig load_config(const std::string& path) {
         pcfg.iface = j.value("interface", j.value("iface", ""));
         pcfg.rules_file = j.value("rules_file", "");
         pcfg.ddos_threshold = j.value("ddos_threshold", 10000);
+        pcfg.port_scan_threshold = j.value("port_scan_threshold", 20);
         cfg.pipelines.push_back(pcfg);
     }
 
@@ -235,7 +237,7 @@ bool NidsApp::start() {
             // Push config to BPF maps
             NidsConfig cfg;
             cfg.ddos_threshold = pcfg.ddos_threshold;
-            cfg.port_scan_threshold = 20;  // TODO: add to pcfg
+            cfg.port_scan_threshold = pcfg.port_scan_threshold;
             ebpf_nic->set_config(cfg);
 
             ebpf_nic->set_alert_callback([this](const AlertEvent& event) {

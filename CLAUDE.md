@@ -85,7 +85,6 @@ IDPS is a high-performance Network Intrusion Detection System using XDP/eBPF for
 | DNS Tracking | `dns_amp_track` | DNS amplification detection (single LRU table keyed by victim_ip) |
 | Port Scan | `port_scan_track` LRU_HASH | Port scan detection per (src_ip, dst_ip), tracks SYN/FIN/NULL/XMAS packets |
 | Frag Track | `frag_track`, `frag_buffers` | IPv4/IPv6 defragmentation |
-| XDP Pipeline | `xdp_jmp_table`, `xdp_ctx_buffer` | Tail call XDP pipeline |
 
 ### Userspace Components
 
@@ -99,9 +98,7 @@ IDPS is a high-performance Network Intrusion Detection System using XDP/eBPF for
 | CommThread | `src/threads/comm_thread.cpp` | Write events to JSON log (+syslog) |
 | RuleParser | `src/rules/rule_parser.cpp` | Parse Snort-like rules |
 | BMHSearch | `src/utils/bmh_search.h` | Boyer-Moore-Horspool pattern matching |
-| XdpProcessor | `src/xdp/af_xdp.cpp` | AF_XDP user-space DPI with TLS metadata extraction (version, SNI, cipher) |
-| BMHSearch | `src/utils/bmh_search.h` | Boyer-Moore-Horspool pattern matching |
-| XdpProcessor | `src/xdp/af_xdp.cpp` | AF_XDP for user-space DPI |
+| XdpProcessor | `src/xdp/af_xdp.cpp` | AF_XDP user-space DPI with TLS metadata extraction (version, SNI, cipher) and BMH content matching |
 | NidsApp | `src/app/nids_app.cpp` | Main app orchestrating all components |
 | PrometheusServer | `src/metrics/prometheus_server.cpp` | HTTP metrics endpoint (port 8080) |
 | MetricsRegistry | `src/metrics/metrics_registry.cpp` | Prometheus metrics collector |
@@ -155,7 +152,7 @@ sudo ./build/bin/nids eth0 rules.txt /tmp/events.json debug
   "use_syslog": true,
   "metrics_port": 8080,
   "pipelines": [
-    {"iface": "eth0", "rules_file": "/etc/nids/rules.txt", "ddos_threshold": 10000}
+    {"iface": "eth0", "rules_file": "/etc/nids/rules.txt", "ddos_threshold": 10000, "port_scan_threshold": 20}
   ]
 }
 ```
@@ -168,7 +165,7 @@ sudo ./build/bin/nids eth0 rules.txt /tmp/events.json debug
 ## Rule Format
 
 ```
-<id> <proto> <dst_port> "<content>" "<message>"
+<id> <proto> <dst_port> "<content>" "<message>" [tls_version=<hex>] [sni="<pattern>"] [cipher=<hex>]
 ```
 
 | Field | Values |
@@ -178,10 +175,13 @@ sudo ./build/bin/nids eth0 rules.txt /tmp/events.json debug
 | `dst_port` | Port number, `port:port` range, or `any`/`0` |
 | `content` | Substring to match (empty = match all on proto/port) |
 | `message` | Alert description |
+| `tls_version` | Match weak TLS version (e.g. `0x0301` for TLS 1.0) |
+| `sni` | Match SNI hostname substring (requires quotes) |
+| `cipher` | Match TLS cipher suite (e.g. `0x0005` for RC4) |
 
 **Rules are split into:**
 - **Simple rules** (content=""): pushed to eBPF kernel for fast proto/port matching
-- **Content rules** (content!=""): require user-space BMH matching via AF_XDP
+- **Content rules** (content!="" or TLS options): require user-space matching via AF_XDP
 
 ## Event Types
 

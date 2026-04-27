@@ -21,6 +21,7 @@ AppConfig load_config(const std::string& path);
 struct PipelineConfig {
     std::string iface;             ///< Network interface name, e.g., "eth0"
     uint32_t    ddos_threshold = 10000;
+    uint32_t    port_scan_threshold = 20;
     int         capture_cpu = -1;
     std::string rules_file;        ///< Path to rules file (optional)
 };

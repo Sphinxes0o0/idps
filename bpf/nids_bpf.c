@@ -411,6 +411,82 @@ static __always_inline int check_syn_flood(__u32 src_ip, __u32 dst_ip,
  * 检查 ICMP 包，如果源 IP 发送大量 ICMP 则判定为 flood
  * 返回: 0=正常, 1=flood detected
  */
+/*
+ * Parse IPv6 packet and extract 5-tuple with transport layer header
+ * Handles extension headers by skipping them to find the actual transport protocol
+ *
+ * Returns: 0 on success, -1 on error
+ */
+static __always_inline int parse_ipv6(void *data, void *data_end,
+                                      __u32 *src_ip, __u32 *dst_ip,
+                                      __u16 *src_port, __u16 *dst_port,
+                                      __u8 *protocol, __u32 *pkt_len,
+                                      __u8 *tcp_flags, void **transport_hdr) {
+    struct ethhdr *eth = (struct ethhdr *)data;
+    struct ipv6hdr *ipv6 = (struct ipv6hdr *)(eth + 1);
+
+    if ((void *)(ipv6 + 1) > data_end)
+        return -1;
+
+    /* Extract first 32 bits of IPv6 addresses for tracking (truncation is acceptable for detection) */
+    *src_ip = ipv6->saddr.in6_u.u6_addr32[0];
+    *dst_ip = ipv6->daddr.in6_u.u6_addr32[0];
+    *protocol = ipv6->nexthdr;
+    *pkt_len = bpf_ntohs(ipv6->payload_len) + sizeof(struct ipv6hdr);
+
+    /* Initialize tcp_flags */
+    *tcp_flags = 0;
+    *src_port = 0;
+    *dst_port = 0;
+
+    /* Skip extension headers to find transport header */
+    __u8 nexthdr = ipv6->nexthdr;
+    void *hdr = (void *)(ipv6 + 1);
+
+    /* Extension header types to skip */
+    /* 0: Hop-by-Hop Options, 43: Routing, 44: Fragment, 50: ESP, 51: AH, 60: Destination Options */
+    while (nexthdr == 0 || nexthdr == 43 || nexthdr == 44 ||
+           nexthdr == 50 || nexthdr == 51 || nexthdr == 60) {
+        struct ipv6_opt_hdr *opt_hdr = (struct ipv6_opt_hdr *)hdr;
+
+        if ((void *)(opt_hdr + 1) > data_end)
+            return -1;
+
+        nexthdr = opt_hdr->nexthdr;
+        /* Extension header length is in 8-byte units, plus the 8-byte header itself */
+        __u8 ext_len = (nexthdr == 44) ? 8 : (opt_hdr->hdrlen + 1) * 8;
+        hdr = (__u8 *)hdr + ext_len;
+
+        if (hdr >= data_end)
+            return -1;
+    }
+
+    *transport_hdr = hdr;
+    *protocol = nexthdr;
+
+    /* Parse transport layer */
+    if (nexthdr == IPPROTO_TCP) {
+        struct tcphdr *tcp = (struct tcphdr *)hdr;
+        if ((void *)(tcp + 1) > data_end)
+            return -1;
+        *src_port = bpf_ntohs(tcp->source);
+        *dst_port = bpf_ntohs(tcp->dest);
+        *tcp_flags = *((__u8 *)tcp + 13);
+    } else if (nexthdr == IPPROTO_UDP) {
+        struct udphdr *udp = (struct udphdr *)hdr;
+        if ((void *)(udp + 1) > data_end)
+            return -1;
+        *src_port = bpf_ntohs(udp->source);
+        *dst_port = bpf_ntohs(udp->dest);
+    } else if (nexthdr == IPPROTO_ICMPV6) {
+        /* ICMPv6 - no ports */
+        *src_port = 0;
+        *dst_port = 0;
+    }
+
+    return 0;
+}
+
 static __always_inline int check_icmp_flood(__u32 src_ip);
 
 /*
@@ -1032,6 +1108,134 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
         }
     }
 
+    /* IPv6 Deep Detection - parse and detect before IPv4 path */
+    __u32 ipv6_src_ip = 0, ipv6_dst_ip = 0;
+    __u16 ipv6_src_port = 0, ipv6_dst_port = 0;
+    __u8 ipv6_protocol = 0, ipv6_tcp_flags = 0;
+    __u32 ipv6_pkt_len = 0;
+    void *ipv6_transport_hdr = NULL;
+
+    /* Re-check eth_proto for IPv6 detection (parse_packet sets src_ip/dst_ip to 0 for IPv6) */
+    eth = (struct ethhdr *)data;
+    if ((void *)(eth + 1) <= data_end) {
+        __u16 eth_proto = bpf_ntohs(eth->h_proto);
+
+        if (eth_proto == ETH_P_IPV6) {
+            /* IPv6: Parse with extension header support */
+            ret = parse_ipv6(data, data_end,
+                           &ipv6_src_ip, &ipv6_dst_ip,
+                           &ipv6_src_port, &ipv6_dst_port,
+                           &ipv6_protocol, &ipv6_pkt_len,
+                           &ipv6_tcp_flags, &ipv6_transport_hdr);
+
+            if (ret == 0) {
+                /* SYN flood detection */
+                if (ipv6_protocol == IPPROTO_TCP) {
+                    check_syn_flood(ipv6_src_ip, ipv6_dst_ip, ipv6_dst_port, ipv6_tcp_flags);
+                }
+
+                /* Port scan detection */
+                if (ipv6_protocol == IPPROTO_TCP) {
+                    check_port_scan(ipv6_src_ip, ipv6_dst_ip, ipv6_dst_port, ipv6_tcp_flags);
+                }
+
+                /* ICMPv6 flood detection (protocol 58 = IPPROTO_ICMPV6) */
+                if (ipv6_protocol == IPPROTO_ICMPV6) {
+                    check_icmp_flood(ipv6_src_ip);
+                }
+
+                /* DNS Amplification detection */
+                if (ipv6_protocol == IPPROTO_UDP) {
+                    check_dns_amplification(ipv6_src_ip, ipv6_dst_ip,
+                                           ipv6_src_port, ipv6_dst_port, ipv6_pkt_len);
+                }
+
+                /* Protocol detection for TCP with payload */
+                if (ipv6_protocol == IPPROTO_TCP && ipv6_transport_hdr != NULL) {
+                    struct tcphdr *tcp = (struct tcphdr *)ipv6_transport_hdr;
+                    if ((void *)(tcp + 1) <= data_end) {
+                        __u32 tcp_header_len = tcp->doff * 4;
+                        __u8 *payload = (__u8 *)tcp + tcp_header_len;
+                        /* IPv6 header is 40 bytes, no extension headers should be here if we parsed correctly */
+                        __u32 payload_len = ipv6_pkt_len - sizeof(struct ipv6hdr) - tcp_header_len;
+
+                        if (payload_len > 0) {
+                            /* HTTP detection on ports 80, 8080 */
+                            if (ipv6_dst_port == 80 || ipv6_dst_port == 8080) {
+                                if (check_http(payload, payload_len)) {
+                                    send_alert(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port,
+                                               IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_HTTP_DETECTED);
+                                    increment_stat(STATS_HTTP_DETECTED, 1);
+                                }
+                            }
+                            /* SSH detection on port 22 */
+                            if (ipv6_dst_port == 22) {
+                                if (check_ssh(payload, payload_len)) {
+                                    send_alert(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port,
+                                               IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_SSH_BANNER);
+                                    increment_stat(STATS_SSH_BANNER, 1);
+                                }
+                            }
+                            /* FTP detection on port 21 */
+                            if (ipv6_dst_port == 21) {
+                                if (check_ftp(payload, payload_len)) {
+                                    send_alert(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port,
+                                               IPPROTO_TCP, SEVERITY_MEDIUM, 0, EVENT_FTP_CMD);
+                                    increment_stat(STATS_FTP_CMD, 1);
+                                }
+                            }
+                            /* Telnet detection on port 23 */
+                            if (ipv6_dst_port == 23) {
+                                if (check_telnet(payload, payload_len)) {
+                                    send_alert(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port,
+                                               IPPROTO_TCP, SEVERITY_MEDIUM, 0, EVENT_TELNET_OPT);
+                                    increment_stat(STATS_TELNET_OPT, 1);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* Rule matching for IPv6 (uses truncated IPs for indexing) */
+                if (match_rules_enabled) {
+                    __u32 matched = match_simple_rules(ipv6_protocol, ipv6_dst_port);
+                    if (matched > 0) {
+                        __u32 dpi_needed = (matched >> 31) & 1;
+                        __u32 action = (matched >> 30) & 1;
+                        __u32 rule_id = matched & 0x3FFFFFFF;
+
+                        if (dpi_needed) {
+                            send_alert(ipv6_src_ip, ipv6_dst_ip,
+                                      ipv6_src_port, ipv6_dst_port,
+                                      ipv6_protocol, SEVERITY_MEDIUM,
+                                      rule_id, EVENT_DPI_REQUEST);
+                        } else if (action == 1 && get_config_drop_enabled()) {
+                            send_alert(ipv6_src_ip, ipv6_dst_ip,
+                                      ipv6_src_port, ipv6_dst_port,
+                                      ipv6_protocol, SEVERITY_HIGH,
+                                      rule_id, EVENT_RULE_MATCH);
+                            increment_stat(STATS_RULE_MATCHES, 1);
+                            increment_stat(STATS_PACKETS_DROPPED, 1);
+                            return XDP_DROP;
+                        } else {
+                            send_alert(ipv6_src_ip, ipv6_dst_ip,
+                                      ipv6_src_port, ipv6_dst_port,
+                                      ipv6_protocol, SEVERITY_HIGH,
+                                      rule_id, EVENT_RULE_MATCH);
+                            increment_stat(STATS_RULE_MATCHES, 1);
+                        }
+                    }
+                }
+            }
+
+            /* IPv6: Continue to flow tracking with truncated IPs, then pass */
+            /* Note: Flow tracking for IPv6 uses first 32 bits of IPs (key src_ip/dst_ip will be 0 from parse_packet) */
+            increment_stat(STATS_PACKETS_TOTAL, 1);
+            return XDP_PASS;
+        }
+    }
+
+    /* IPv4 and other: Parse and detect normally */
     /* 解析数据包 */
     ret = parse_packet(data, data_end, &key, &pkt_len, &tcp_flags);
     if (ret != 0) {

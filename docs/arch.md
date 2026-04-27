@@ -32,7 +32,7 @@ IDPS (Intrusion Detection & Prevention System) uses XDP/eBPF for kernel-level pa
 │   DPI Infrastructure:                                           │
 │   - BMH Boyer-Moore-Horspool algorithm (utils/bmh_search.h)  │
 │   - Rule parser (rules/rule_parser.h)                        │
-│   - EVENT_DPI_REQUEST handling (placeholder)                │
+│   - AF_XDP processor for TLS metadata extraction            │
 └─────────────────────────────────────────────────────────────┘
 ```
 

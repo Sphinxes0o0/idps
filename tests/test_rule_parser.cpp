@@ -98,3 +98,56 @@ TEST_F(RuleParserTest, FileNotFound) {
     EXPECT_TRUE(rs.content_rules.empty());
     EXPECT_FALSE(parser.error().empty());
 }
+
+TEST_F(RuleParserTest, ParseTlsVersionRule) {
+    RuleParser parser;
+    MatchRule rule;
+
+    EXPECT_TRUE(parser.parse_line(R"(100 tcp 443 "" "Weak TLS" [tls_version=0x0301])", rule));
+    EXPECT_EQ(rule.id, 100);
+    EXPECT_EQ(rule.tls_version, 0x0301);
+    EXPECT_TRUE(rule.need_dpi);  // TLS option set means DPI needed
+    EXPECT_EQ(rule.message, "Weak TLS");
+}
+
+TEST_F(RuleParserTest, ParseTlsSniRule) {
+    RuleParser parser;
+    MatchRule rule;
+
+    EXPECT_TRUE(parser.parse_line(R"(101 tcp 443 "" "Blocked SNI" [sni="evil.com"])", rule));
+    EXPECT_EQ(rule.id, 101);
+    EXPECT_EQ(rule.tls_sni, "evil.com");
+    EXPECT_TRUE(rule.need_dpi);
+}
+
+TEST_F(RuleParserTest, ParseTlsCipherRule) {
+    RuleParser parser;
+    MatchRule rule;
+
+    EXPECT_TRUE(parser.parse_line(R"(102 tcp 443 "" "Weak cipher" [cipher=0x0005])", rule));
+    EXPECT_EQ(rule.id, 102);
+    EXPECT_EQ(rule.tls_cipher, 0x0005);
+    EXPECT_TRUE(rule.need_dpi);
+}
+
+TEST_F(RuleParserTest, ParseTlsMultipleOptions) {
+    RuleParser parser;
+    MatchRule rule;
+
+    EXPECT_TRUE(parser.parse_line(
+        R"(103 tcp 443 "" "Bad TLS" [tls_version=0x0301] [sni="malware.com"] [cipher=0x0005])",
+        rule));
+    EXPECT_EQ(rule.id, 103);
+    EXPECT_EQ(rule.tls_version, 0x0301);
+    EXPECT_EQ(rule.tls_sni, "malware.com");
+    EXPECT_EQ(rule.tls_cipher, 0x0005);
+    EXPECT_TRUE(rule.need_dpi);
+}
+
+TEST_F(RuleParserTest, ParseTlsVersionDecimal) {
+    RuleParser parser;
+    MatchRule rule;
+
+    EXPECT_TRUE(parser.parse_line(R"(104 tcp 443 "" "TLS 1.0" [tls_version=769])", rule));
+    EXPECT_EQ(rule.tls_version, 769);  // 0x0301 = 769
+}

@@ -173,7 +173,9 @@ bool RuleParser::parse_line(const std::string& line, MatchRule& rule) {
                 } else {
                     rule.tls_version = static_cast<uint16_t>(std::stoul(val));
                 }
-            } catch (...) {}
+            } catch (...) {
+                error_ = "invalid tls_version value: " + val;
+            }
         } else if (key == "sni") {
             // 去除引号
             if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
@@ -188,7 +190,9 @@ bool RuleParser::parse_line(const std::string& line, MatchRule& rule) {
                 } else {
                     rule.tls_cipher = static_cast<uint16_t>(std::stoul(val));
                 }
-            } catch (...) {}
+            } catch (...) {
+                error_ = "invalid cipher value: " + val;
+            }
         }
     }
 

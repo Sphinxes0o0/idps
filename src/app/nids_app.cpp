@@ -182,11 +182,26 @@ bool NidsApp::reload_rules() {
 
         // Update AF_XDP rules if running
         if (inst.xdp) {
+            inst.xdp->clear_all_rules();
+
             std::vector<std::pair<std::string, int>> dpi_rules;
             for (const auto& rule : inst.content_rules) {
                 dpi_rules.emplace_back(rule.content, static_cast<int>(rule.id));
             }
             inst.xdp->set_rules(dpi_rules);
+
+            // Re-wire TLS rules
+            for (const auto& rule : inst.content_rules) {
+                if (rule.tls_version != 0) {
+                    inst.xdp->add_tls_version_rule(rule.tls_version, rule.id, rule.message);
+                }
+                if (!rule.tls_sni.empty()) {
+                    inst.xdp->add_sni_rule(rule.tls_sni, rule.id, rule.message);
+                }
+                if (rule.tls_cipher != 0) {
+                    inst.xdp->add_cipher_rule(rule.tls_cipher, rule.id, rule.message);
+                }
+            }
         }
     }
 
@@ -277,6 +292,19 @@ bool NidsApp::start() {
                     dpi_rules.emplace_back(rule.content, static_cast<int>(rule.id));
                 }
                 inst.xdp->set_rules(dpi_rules);
+
+                // Wire TLS-specific rules to XdpProcessor
+                for (const auto& rule : inst.content_rules) {
+                    if (rule.tls_version != 0) {
+                        inst.xdp->add_tls_version_rule(rule.tls_version, rule.id, rule.message);
+                    }
+                    if (!rule.tls_sni.empty()) {
+                        inst.xdp->add_sni_rule(rule.tls_sni, rule.id, rule.message);
+                    }
+                    if (rule.tls_cipher != 0) {
+                        inst.xdp->add_cipher_rule(rule.tls_cipher, rule.id, rule.message);
+                    }
+                }
 
                 // Set DPI callback to feed results into event queue
                 inst.xdp->set_dpi_callback([this](const XdpPacket& pkt, const DpiResult& result) {

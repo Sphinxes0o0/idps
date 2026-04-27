@@ -28,6 +28,11 @@ struct MatchRule {
     uint16_t    dst_port = 0;   ///< 起始端口（0=any）
     uint16_t    dst_port_max = 0; ///< 范围结束端口（0=单端口）
     bool        need_dpi = false; ///< 是否需要深度内容检查
+
+    /* TLS-specific fields */
+    uint16_t    tls_version = 0;    ///< TLS version to match (0 = any, e.g. 0x0301 for TLS 1.0)
+    std::string tls_sni;           ///< SNI hostname pattern to match (substring)
+    uint16_t    tls_cipher = 0;    ///< TLS cipher suite to match (0 = any)
 };
 
 /**

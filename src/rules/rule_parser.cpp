@@ -152,8 +152,49 @@ bool RuleParser::parse_line(const std::string& line, MatchRule& rule) {
         return false;
     }
 
+    // 6. 可选: TLS 特定选项 [tls_version=0x0301] [sni="pattern"] [cipher=0x0005]
+    while (iss >> token) {
+        if (token[0] != '[' || token.back() != ']') {
+            break;  // 不是选项格式，停止解析
+        }
+        // 去除方括号
+        std::string opt = token.substr(1, token.size() - 2);
+        size_t eq = opt.find('=');
+        if (eq == std::string::npos) {
+            continue;  // 忽略无效选项
+        }
+        std::string key = trim(opt.substr(0, eq));
+        std::string val = trim(opt.substr(eq + 1));
+
+        if (key == "tls_version" && !val.empty()) {
+            try {
+                if (val.substr(0, 2) == "0x" || val.substr(0, 2) == "0X") {
+                    rule.tls_version = static_cast<uint16_t>(std::stoul(val, nullptr, 16));
+                } else {
+                    rule.tls_version = static_cast<uint16_t>(std::stoul(val));
+                }
+            } catch (...) {}
+        } else if (key == "sni") {
+            // 去除引号
+            if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+                rule.tls_sni = val.substr(1, val.size() - 2);
+            } else {
+                rule.tls_sni = val;
+            }
+        } else if (key == "cipher" && !val.empty()) {
+            try {
+                if (val.substr(0, 2) == "0x" || val.substr(0, 2) == "0X") {
+                    rule.tls_cipher = static_cast<uint16_t>(std::stoul(val, nullptr, 16));
+                } else {
+                    rule.tls_cipher = static_cast<uint16_t>(std::stoul(val));
+                }
+            } catch (...) {}
+        }
+    }
+
     // 判断是否需要 DPI
-    rule.need_dpi = !rule.content.empty();
+    rule.need_dpi = !rule.content.empty() || rule.tls_version != 0 ||
+                    !rule.tls_sni.empty() || rule.tls_cipher != 0;
 
     return true;
 }

@@ -13,6 +13,71 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstddef>
+
+/* AF_XDP constants (from linux/if_xdp.h) */
+#ifndef AF_XDP
+#define AF_XDP 44
+#endif
+#ifndef SOL_XDP
+#define SOL_XDP 283
+#endif
+#ifndef XDP_SHARED_UMEM
+#define XDP_SHARED_UMEM (1 << 0)
+#endif
+#ifndef XDP_UMEM_UNALIGNED_CHUNK_FLAG
+#define XDP_UMEM_UNALIGNED_CHUNK_FLAG (1 << 0)
+#endif
+#ifndef XDP_UMEM_REG
+#define XDP_UMEM_REG 4
+#endif
+#ifndef XDP_UMEM_FILL_RING
+#define XDP_UMEM_FILL_RING 5
+#endif
+#ifndef XDP_UMEM_COMPLETION_RING
+#define XDP_UMEM_COMPLETION_RING 6
+#endif
+#ifndef XDP_MMAP_OFFSETS
+#define XDP_MMAP_OFFSETS 1
+#endif
+#ifndef XDP_UMEM_PGOFF_FILL_RING
+#define XDP_UMEM_PGOFF_FILL_RING 0x100000000ULL
+#endif
+#ifndef XDP_UMEM_PGOFF_COMPLETION_RING
+#define XDP_UMEM_PGOFF_COMPLETION_RING 0x180000000ULL
+#endif
+
+/* From linux/if_xdp.h (for UMEM setup) */
+struct xdp_umem_reg {
+    uint64_t addr;
+    uint64_t len;
+    uint32_t chunk_size;
+    uint32_t headroom;
+    uint32_t flags;
+    uint32_t tx_metadata_len;
+};
+
+struct sockaddr_xdp {
+    uint16_t sxdp_family;
+    uint16_t sxdp_flags;
+    uint32_t sxdp_ifindex;
+    uint32_t sxdp_queue_id;
+    uint32_t sxdp_shared_umem_fd;
+};
+
+struct xdp_ring_offset {
+    uint64_t producer;
+    uint64_t consumer;
+    uint64_t desc;
+    uint64_t flags;
+};
+
+struct xdp_mmap_offsets {
+    struct xdp_ring_offset rx;
+    struct xdp_ring_offset tx;
+    struct xdp_ring_offset fr;
+    struct xdp_ring_offset cr;
+};
 
 struct xdp_socket;
 
@@ -101,6 +166,11 @@ public:
     void set_rules(const std::vector<std::pair<std::string, int>>& rules);
 
     /**
+     * @brief 清除所有规则 (用于热重载)
+     */
+    void clear_all_rules();
+
+    /**
      * @brief 开始处理数据包
      * @note 此函数会阻塞，直到 close() 被调用
      */
@@ -175,6 +245,29 @@ private:
     std::vector<TlsVersionRule> tls_version_rules_;
     std::vector<SniRule> sni_rules_;
     std::vector<CipherRule> cipher_rules_;
+
+    /* AF_XDP UMEM */
+    uint8_t* umem_area_ = nullptr;  ///< mmap'd UMEM region
+    uint32_t num_frames_ = 4096;
+    uint32_t frame_size_ = 2048;
+    struct xdp_ring_offset {
+        uint64_t producer;
+        uint64_t consumer;
+        uint64_t desc;
+        uint64_t flags;
+    };
+    struct xdp_ring_offsets {
+        struct xdp_ring_offset fill;
+        struct xdp_ring_offset completion;
+    } ring_offsets_;
+    struct xdp_desc {
+        uint64_t addr;
+        uint32_t len;
+        uint32_t options;
+    };
+    struct xdp_desc* fill_ring_ = nullptr;  ///< mmap'd fill ring
+    struct xdp_desc* completion_ring_ = nullptr;  ///< mmap'd completion ring
+    uint64_t umem_size_;
 };
 
 } // namespace nids

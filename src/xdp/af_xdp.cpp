@@ -6,19 +6,21 @@
 #include "af_xdp.h"
 #include "../utils/bmh_search.h"
 #include "../core/logger.h"
-#include <linux/if_xdp.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/fcntl.h>
 #include <unistd.h>
 #include <cstring>
 #include <errno.h>
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 
 namespace nids {
 
@@ -61,6 +63,10 @@ bool XdpProcessor::open(const XdpConfig& config) {
         return true;
     }
 
+    num_frames_ = config.num_frames;
+    frame_size_ = config.frame_size;
+    umem_size_ = num_frames_ * frame_size_;
+
     // 创建 AF_XDP socket
     sock_fd_ = socket(AF_XDP, SOCK_RAW, 0);
     if (sock_fd_ < 0) {
@@ -76,12 +82,36 @@ bool XdpProcessor::open(const XdpConfig& config) {
         return false;
     }
 
-    // 设置 XDP 地址
+    // 注册 UMEM
+    struct xdp_umem_reg mr = {};
+    mr.addr = 0;  // 让内核分配
+    mr.len = umem_size_;
+    mr.chunk_size = frame_size_;
+    mr.headroom = 0;
+    mr.flags = XDP_UMEM_UNALIGNED_CHUNK_FLAG;
+
+    if (setsockopt(sock_fd_, SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr)) < 0) {
+        LOG_ERR("xdp", "failed to register UMEM: %s", strerror(errno));
+        close();
+        return false;
+    }
+
+    // mmap UMEM area
+    umem_area_ = static_cast<uint8_t*>(mmap(nullptr, umem_size_,
+                                              PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (umem_area_ == MAP_FAILED) {
+        LOG_ERR("xdp", "failed to mmap UMEM: %s", strerror(errno));
+        close();
+        return false;
+    }
+
+    // 设置 XDP 地址 (bind 前需要先设好 UMEM)
     struct sockaddr_xdp addr = {};
     addr.sxdp_family = AF_XDP;
     addr.sxdp_ifindex = ifindex;
     addr.sxdp_queue_id = config.queue_id;
-    addr.sxdp_flags = XDP_SHARED_UMEM;
+    addr.sxdp_flags = 0;  // 不共享 UMEM
 
     if (bind(sock_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         LOG_ERR("xdp", "failed to bind socket: %s", strerror(errno));
@@ -89,14 +119,78 @@ bool XdpProcessor::open(const XdpConfig& config) {
         return false;
     }
 
+    // 获取 mmap offsets
+    struct xdp_mmap_offsets off = {};
+    socklen_t optlen = sizeof(off);
+    if (getsockopt(sock_fd_, SOL_XDP, XDP_MMAP_OFFSETS, &off, &optlen) < 0) {
+        LOG_ERR("xdp", "failed to get mmap offsets: %s", strerror(errno));
+        close();
+        return false;
+    }
+    ring_offsets_.fill.producer = off.fr.producer;
+    ring_offsets_.fill.consumer = off.fr.consumer;
+    ring_offsets_.fill.desc = off.fr.desc;
+    ring_offsets_.fill.flags = off.fr.flags;
+    ring_offsets_.completion.producer = off.cr.producer;
+    ring_offsets_.completion.consumer = off.cr.consumer;
+    ring_offsets_.completion.desc = off.cr.desc;
+    ring_offsets_.completion.flags = off.cr.flags;
+
+    // mmap fill ring
+    fill_ring_ = static_cast<struct xdp_desc*>(
+        mmap(nullptr, num_frames_ * sizeof(struct xdp_desc),
+             PROT_READ | PROT_WRITE, MAP_SHARED, sock_fd_,
+             XDP_UMEM_PGOFF_FILL_RING));
+    if (fill_ring_ == MAP_FAILED) {
+        LOG_ERR("xdp", "failed to mmap fill ring: %s", strerror(errno));
+        close();
+        return false;
+    }
+
+    // mmap completion ring
+    completion_ring_ = static_cast<struct xdp_desc*>(
+        mmap(nullptr, num_frames_ * sizeof(struct xdp_desc),
+             PROT_READ | PROT_WRITE, MAP_SHARED, sock_fd_,
+             XDP_UMEM_PGOFF_COMPLETION_RING));
+    if (completion_ring_ == MAP_FAILED) {
+        LOG_ERR("xdp", "failed to mmap completion ring: %s", strerror(errno));
+        close();
+        return false;
+    }
+
+    // 预填充 fill ring: 将所有帧地址放入 fill ring
+    for (uint32_t i = 0; i < num_frames_; i++) {
+        fill_ring_[i].addr = reinterpret_cast<uint64_t>(umem_area_ + i * frame_size_);
+        fill_ring_[i].len = frame_size_;
+        fill_ring_[i].options = 0;
+    }
+
+    // 设置 socket 为非阻塞
+    int sock_flags = fcntl(sock_fd_, F_GETFL, 0);
+    fcntl(sock_fd_, F_SETFL, sock_flags | O_NONBLOCK);
+
     opened_ = true;
-    LOG_INFO("xdp", "opened AF_XDP on %s queue %u", config.iface.c_str(), config.queue_id);
+    LOG_INFO("xdp", "opened AF_XDP on %s queue %u (%u frames @ %u bytes)",
+             config.iface.c_str(), config.queue_id, num_frames_, frame_size_);
     return true;
 }
 
 void XdpProcessor::close() {
     if (running_) {
         stop();
+    }
+
+    if (fill_ring_ != nullptr && fill_ring_ != MAP_FAILED) {
+        munmap(fill_ring_, num_frames_ * sizeof(struct xdp_desc));
+        fill_ring_ = nullptr;
+    }
+    if (completion_ring_ != nullptr && completion_ring_ != MAP_FAILED) {
+        munmap(completion_ring_, num_frames_ * sizeof(struct xdp_desc));
+        completion_ring_ = nullptr;
+    }
+    if (umem_area_ != nullptr && umem_area_ != MAP_FAILED) {
+        munmap(umem_area_, umem_size_);
+        umem_area_ = nullptr;
     }
 
     if (sock_fd_ >= 0) {
@@ -110,6 +204,13 @@ void XdpProcessor::close() {
 
 void XdpProcessor::set_rules(const std::vector<std::pair<std::string, int>>& rules) {
     rules_ = rules;
+}
+
+void XdpProcessor::clear_all_rules() {
+    rules_.clear();
+    tls_version_rules_.clear();
+    sni_rules_.clear();
+    cipher_rules_.clear();
 }
 
 void XdpProcessor::run() {
@@ -132,16 +233,132 @@ void XdpProcessor::stop() {
 }
 
 void XdpProcessor::process_packets() {
-    // Note: This is a placeholder implementation.
-    // Full AF_XDP requires:
-    // 1. UMEM setup with mmap (frames, fill ring, completion ring)
-    // 2. recvmsg() to receive packets
-    // 3. Frame recycling
-    //
-    // For now, record statistics to indicate the thread is alive.
-    // TLS detection is still performed when parse_packet() is called externally
-    // (e.g., for testing or integration with other packet sources).
-    rx_count_++;
+    // Use poll to wait for packets with timeout
+    struct pollfd pfd = {};
+    pfd.fd = sock_fd_;
+    pfd.events = POLLIN;
+
+    int ret = poll(&pfd, 1, 100);  // 100ms timeout
+    if (ret <= 0) {
+        return;  // timeout or error
+    }
+
+    // Access producer/consumer counters via UMEM base + offset
+    volatile uint64_t* fprod = reinterpret_cast<volatile uint64_t*>(
+        umem_area_ + ring_offsets_.fill.producer);
+    volatile uint64_t* fcons = reinterpret_cast<volatile uint64_t*>(
+        umem_area_ + ring_offsets_.fill.consumer);
+    volatile uint64_t* cprod = reinterpret_cast<volatile uint64_t*>(
+        umem_area_ + ring_offsets_.completion.producer);
+    volatile uint64_t* ccons = reinterpret_cast<volatile uint64_t*>(
+        umem_area_ + ring_offsets_.completion.consumer);
+
+    // Process completion ring: recycle frames back to fill ring
+    while (*ccons != *cprod) {
+        uint32_t idx = (*ccons) & (num_frames_ - 1);
+        uint64_t frame_addr = completion_ring_[idx].addr;
+        uint32_t frame_len = completion_ring_[idx].len;
+
+        // Add back to fill ring if there's space
+        if ((*fprod - *fcons) < num_frames_) {
+            uint32_t fill_idx = (*fprod) & (num_frames_ - 1);
+            fill_ring_[fill_idx].addr = frame_addr;
+            fill_ring_[fill_idx].len = frame_len;
+            fill_ring_[fill_idx].options = 0;
+            (*fprod)++;
+        }
+        (*ccons)++;
+    }
+
+    // Receive packets - build iovecs from fill ring descriptors
+    static constexpr int BATCH_SIZE = 64;
+    struct iovec iov[BATCH_SIZE];
+    struct mmsghdr msg[BATCH_SIZE];
+    char* frames[BATCH_SIZE];
+    int frame_count = 0;
+
+    memset(msg, 0, sizeof(msg));
+    while (frame_count < BATCH_SIZE) {
+        if (*fprod == *fcons) {
+            break;  // fill ring empty
+        }
+
+        uint32_t idx = (*fcons) & (num_frames_ - 1);
+        frames[frame_count] = reinterpret_cast<char*>(fill_ring_[idx].addr);
+        uint32_t frm_len = fill_ring_[idx].len;
+
+        iov[frame_count].iov_base = frames[frame_count];
+        iov[frame_count].iov_len = frm_len;
+
+        msg[frame_count].msg_hdr.msg_iov = &iov[frame_count];
+        msg[frame_count].msg_hdr.msg_iovlen = 1;
+
+        (*fcons)++;
+        frame_count++;
+    }
+
+    if (frame_count == 0) {
+        return;
+    }
+
+    int n = recvmmsg(sock_fd_, msg, frame_count, MSG_DONTWAIT, nullptr);
+    if (n <= 0) {
+        // Return frames to completion ring on error
+        for (int i = 0; i < frame_count; i++) {
+            uint32_t idx = (*cprod) & (num_frames_ - 1);
+            completion_ring_[idx].addr = reinterpret_cast<uint64_t>(frames[i]);
+            completion_ring_[idx].len = frame_size_;
+            completion_ring_[idx].options = 0;
+            (*cprod)++;
+        }
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        uint32_t len = msg[i].msg_len;
+        if (len == 0 || len > frame_size_) {
+            // Return empty/invalid frame to completion
+            uint32_t idx = (*cprod) & (num_frames_ - 1);
+            completion_ring_[idx].addr = reinterpret_cast<uint64_t>(frames[i]);
+            completion_ring_[idx].len = frame_size_;
+            completion_ring_[idx].options = 0;
+            (*cprod)++;
+            rx_count_++;
+            continue;
+        }
+
+        XdpPacket pkt = {};
+        pkt.data = reinterpret_cast<uint8_t*>(frames[i]);
+        pkt.len = len;
+        pkt.timestamp = 0;
+
+        if (!parse_packet(pkt.data, pkt.len, pkt)) {
+            uint32_t idx = (*cprod) & (num_frames_ - 1);
+            completion_ring_[idx].addr = reinterpret_cast<uint64_t>(frames[i]);
+            completion_ring_[idx].len = len;
+            completion_ring_[idx].options = 0;
+            (*cprod)++;
+            rx_count_++;
+            continue;
+        }
+
+        // Perform BMH content matching
+        perform_dpi(pkt);
+
+        // Perform TLS detection if we have TLS rules
+        if (pkt.protocol == IPPROTO_TCP && pkt.len > 0) {
+            detect_tls(pkt, pkt.data, pkt.len);
+        }
+
+        rx_count_++;
+
+        // Return frame to completion ring
+        uint32_t idx = (*cprod) & (num_frames_ - 1);
+        completion_ring_[idx].addr = reinterpret_cast<uint64_t>(frames[i]);
+        completion_ring_[idx].len = len;
+        completion_ring_[idx].options = 0;
+        (*cprod)++;
+    }
 }
 
 bool XdpProcessor::parse_packet(uint8_t* data, uint32_t len, XdpPacket& pkt) {
@@ -255,10 +472,8 @@ bool XdpProcessor::parse_tls_record(const uint8_t* data, size_t len, TlsInfo& in
          *   ... then variable-length fields including cipher_suites and extensions
          *
          * For SNI extraction, we look for extension type=0 (SNI) after cipher_suites.
-         * This is complex to parse precisely, so we use a simple search approach.
          */
 
-        /* Extract cipher suite if possible (at offset after session_id) */
         size_t offset = 4; /* client_version + random (4 + 32 = 36, but we start at 4) */
 
         /* Session ID length (1 byte) */
@@ -309,11 +524,11 @@ bool XdpProcessor::parse_tls_record(const uint8_t* data, size_t len, TlsInfo& in
                 if (offset + 2 <= ext_end) {
                     uint16_t sni_list_len = (static_cast<uint16_t>(handshake[offset]) << 8) |
                                             handshake[offset + 1];
-                    (void)sni_list_len; /* suppress unused warning */
+                    (void)sni_list_len;
                     offset += 2;
 
                     if (offset + 3 <= ext_end) {
-                        uint8_t sni_type = handshake[offset]; /* should be 0 = host_name */
+                        uint8_t sni_type = handshake[offset];
                         (void)sni_type;
                         offset += 1;
 

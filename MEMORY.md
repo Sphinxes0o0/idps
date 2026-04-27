@@ -6,49 +6,49 @@
 - **Language**: C++17
 - **Architecture**: eBPF/XDP based NIDS
 
-## Architecture (After Cleanup)
+## Architecture
 ```
 XDP eBPF (内核态)
     ├── 5-tuple 解析
-    ├── DDoS 检测 (滑动窗口)
+    ├── DDoS 检测 (SYN/ICMP flood, DNS amplification)
+    ├── 端口扫描检测 (SYN/FIN/NULL/XMAS 跟踪)
+    ├── 协议检测 (HTTP/SSH/FTP/Telnet banners)
     ├── 简单规则匹配 (协议+端口)
     └── Ringbuf → 用户态
 
 用户态:
     EbpfNic → RingbufReader → EventQueue → CommThread → JSON 日志
+    XdpProcessor (AF_XDP) → TLS 检测 (version/SNI/cipher)
 ```
 
-## Build & Run (Docker on macOS)
+## Build & Run
 ```bash
-# Full build
-docker run --rm -v $(pwd):/idps -w /idps ubuntu:22.04 bash -c \
-  'apt-get update > /dev/null 2>&1 && apt-get install -y cmake clang llvm libbpf-dev pkg-config make git libelf-dev > /dev/null 2>&1 && cmake -S . -B build && cmake --build build -j$(nproc)'
+# Build in ebpf-test container (has bpftool)
+docker exec ebpf-test bash -c 'cd /idps && rm -rf build && cmake -S . -B build && cmake --build build'
 
-# Run tests
-docker run --rm -v $(pwd):/idps -w /idps/build ubuntu:22.04 bash -c \
-  'apt-get update > /dev/null 2>&1 && apt-get install -y cmake libelf-dev > /dev/null 2>&1 && ctest --output-on-failure'
+# Run tests (ctest has path issues - run binaries directly)
+docker exec ebpf-test bash -c 'cd /idps/build && ./bin/test_pool && ./bin/test_queue && ./bin/test_rule_parser'
 ```
 
-## Verified (2026-04-26)
-- ✅ CMake 配置成功
-- ✅ eBPF 编译成功
-- ✅ 用户态代码编译成功（无警告）
-- ✅ 链接成功
-- ✅ 20/20 单元测试通过
+## Implemented Features
+- [x] SYN/ICMP Flood Detection
+- [x] DNS Amplification Detection
+- [x] IPv4/IPv6 Defragmentation (LRU-managed)
+- [x] Port Scan Detection (SYN/FIN/NULL/XMAS)
+- [x] Protocol Detection (HTTP, SSH, FTP, Telnet banners)
+- [x] TLS/HTTPS Detection via AF_XDP (weak version, SNI, cipher)
 
 ## Key Files
 | File | Purpose |
 |------|---------|
 | `bpf/nids_bpf.c` | XDP eBPF 程序 |
+| `bpf/nids_common.h` | Maps, structs, constants (kernel + userspace) |
 | `src/nic/ebpf_nic.h/cpp` | eBPF NIC 接口 |
 | `src/ebpf/ebpf_loader.h/cpp` | libbpf 加载器 |
 | `src/ebpf/ringbuf_reader.h/cpp` | Ringbuf 事件读取 |
+| `src/xdp/af_xdp.cpp` | AF_XDP 用户态 DPI + TLS 检测 |
 | `src/app/nids_app.h/cpp` | 应用主类 |
 | `src/threads/comm_thread.h/cpp` | 事件日志线程 |
 
 ## Dependencies
-- libbpf
-- nlohmann/json
-- GoogleTest
-- clang (for BPF compilation)
-- libelf-dev
+- libbpf, clang (for BPF), libelf-dev, nlohmann/json, GoogleTest

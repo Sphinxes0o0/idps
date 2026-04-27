@@ -68,6 +68,13 @@ public:
     EbpfLoader* get_loader() { return loader_.get(); }
 
     /*
+     * 设置 eBPF 配置参数
+     */
+    void set_config(const NidsConfig& config) {
+        if (loader_) loader_->update_config(config);
+    }
+
+    /*
      * 获取统计信息
      */
     uint64_t get_total_packets() const;

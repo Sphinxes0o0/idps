@@ -218,7 +218,6 @@ bool XdpProcessor::parse_tls_record(const uint8_t* data, size_t len, TlsInfo& in
 
     uint8_t content_type = data[0];
     uint16_t version = (static_cast<uint16_t>(data[1]) << 8) | data[2];
-    uint16_t tls_length = (static_cast<uint16_t>(data[3]) << 8) | data[4];
 
     if (content_type != TLS_CONTENT_TYPE_HANDSHAKE) {
         return false;

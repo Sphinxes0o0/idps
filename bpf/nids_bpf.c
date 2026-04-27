@@ -45,14 +45,6 @@ static __always_inline void increment_stat(__u32 index, __u64 value) {
 /*
  * 获取配置值 (从 config map)
  */
-static __always_inline __u32 get_config_enabled(void) {
-    __u32 key = 0;
-    struct config_entry *cfg = bpf_map_lookup_elem(&config, &key);
-    if (cfg)
-        return cfg->enabled;
-    return 1;  /* 默认启用 */
-}
-
 static __always_inline __u32 get_config_drop_enabled(void) {
     __u32 key = 0;
     struct config_entry *cfg = bpf_map_lookup_elem(&config, &key);
@@ -231,34 +223,6 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
  * - Times out incomplete fragments after 30 seconds
  * - Allows fragments to pass through for user-space reassembly
  */
-
-/*
- * 检查 IPv4 数据包是否为分片
- * @return 1 如果是分片，0 如果不是
- */
-static __always_inline int is_ipv4_fragment(struct iphdr *ip) {
-    /* IPv4 分片检测: MF flag 或者 offset != 0 */
-    __u16 frag_offset = bpf_ntohs(ip->frag_off);
-    /* IP_OFFSET mask = 0x1FFF (13 bits for offset) */
-    /* IP_MF mask = 0x2000 */
-    return (frag_offset & (0x2000 | 0x1FFF)) != 0;
-}
-
-/*
- * 获取 IPv4 分片的偏移量 (字节单位)
- */
-static __always_inline __u16 get_ipv4_frag_offset(struct iphdr *ip) {
-    __u16 frag_offset = bpf_ntohs(ip->frag_off);
-    return (frag_offset & 0x1FFF) * 8;  /* 13-bit offset in 8-byte units */
-}
-
-/*
- * 检查 IPv4 分片是否有更多分片标记
- */
-static __always_inline int is_ipv4_more_fragments(struct iphdr *ip) {
-    __u16 frag_off = bpf_ntohs(ip->frag_off);
-    return (frag_off & 0x2000) != 0;
-}
 
 /*
  * 解析以太网 + IPv4 + TCP/UDP/ICMP 头

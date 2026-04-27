@@ -217,6 +217,12 @@ bool NidsApp::start() {
         // Set up alert callback to convert eBPF events to SecEvent
         auto* ebpf_nic = dynamic_cast<EbpfNic*>(inst.nic.get());
         if (ebpf_nic) {
+            // Push config to BPF maps
+            NidsConfig cfg;
+            cfg.ddos_threshold = pcfg.ddos_threshold;
+            cfg.port_scan_threshold = 20;  // TODO: add to pcfg
+            ebpf_nic->set_config(cfg);
+
             ebpf_nic->set_alert_callback([this](const AlertEvent& event) {
                 SecEvent sev;
                 sev.timestamp = event.timestamp;

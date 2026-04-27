@@ -15,6 +15,7 @@ static void on_signal(int sig) {
 }
 
 static void on_sigusr1(int sig) {
+    (void)sig;
     std::cerr << "\n[NIDS] Received SIGUSR1 — reloading rules...\n";
     if (g_app) g_app->reload_rules();
 }

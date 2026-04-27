@@ -27,9 +27,9 @@ namespace nids {
 struct NidsConfig {
     uint32_t ddos_threshold = 10000;
     uint32_t window_size_ns = 1000000000;
-    bool enabled = true;
-    bool match_rules_enabled = true;
-    bool drop_enabled = false;  // 是否启用 XDP drop 动作（默认关闭）
+    uint32_t enabled = 1;
+    uint32_t drop_enabled = 0;
+    uint32_t port_scan_threshold = 20;
 };
 
 /*

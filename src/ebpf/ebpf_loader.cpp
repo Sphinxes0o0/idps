@@ -247,16 +247,25 @@ uint64_t EbpfLoader::get_stat(uint32_t index) {
     }
 
     uint32_t key = index;
-    uint64_t value = 0;
 
-    // 简单起见，读取第一个 CPU 的值
-    // 实际应遍历所有 CPU 并求和
-    int err = bpf_map_lookup_elem(stats_fd, &key, &value);
+    /* PERCPU_ARRAY stores a separate value per CPU. We need to sum all of them.
+     * Allocate buffer for max 256 CPUs and sum values returned by kernel. */
+    const int MAX_CPUS = 256;
+    uint64_t per_cpu_buf[MAX_CPUS];
+    memset(per_cpu_buf, 0, sizeof(per_cpu_buf));
+
+    int err = bpf_map_lookup_elem(stats_fd, &key, per_cpu_buf);
     if (err < 0) {
         return 0;
     }
 
-    return value;
+    /* Sum values from all CPUs. Kernel returns values for all CPUs in one call. */
+    uint64_t total = 0;
+    for (int i = 0; i < MAX_CPUS; i++) {
+        total += per_cpu_buf[i];
+    }
+
+    return total;
 }
 
 bool EbpfLoader::load_bpf_object(const std::string& path) {

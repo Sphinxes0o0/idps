@@ -372,7 +372,9 @@ bool XdpProcessor::parse_packet(uint8_t* data, uint32_t len, XdpPacket& pkt) {
     }
 
     struct iphdr* ip = reinterpret_cast<struct iphdr*>(data + sizeof(struct ethhdr));
-    if (ip->version != 4 || ip->ihl < 5) {
+    uint32_t ip_hdr_len = ip->ihl * 4;
+    if (ip->version != 4 || ip_hdr_len < sizeof(struct iphdr) ||
+        ip_hdr_len > len - sizeof(struct ethhdr)) {
         return false;
     }
 
@@ -380,15 +382,21 @@ bool XdpProcessor::parse_packet(uint8_t* data, uint32_t len, XdpPacket& pkt) {
     pkt.dst_ip = ntohl(ip->daddr);
     pkt.protocol = ip->protocol;
 
-    uint8_t* l4 = data + sizeof(struct ethhdr) + ip->ihl * 4;
-    uint32_t l4_len = len - sizeof(struct ethhdr) - ip->ihl * 4;
+    uint8_t* l4 = data + sizeof(struct ethhdr) + ip_hdr_len;
+    uint32_t l4_len = len - sizeof(struct ethhdr) - ip_hdr_len;
 
     if (pkt.protocol == IPPROTO_TCP && l4_len >= sizeof(struct tcphdr)) {
         struct tcphdr* tcp = reinterpret_cast<struct tcphdr*>(l4);
+        if (tcp->doff < 5 || tcp->doff > 15) {
+            return false;
+        }
         pkt.src_port = ntohs(tcp->source);
         pkt.dst_port = ntohs(tcp->dest);
         pkt.data = l4 + tcp->doff * 4;
         pkt.len = l4_len - tcp->doff * 4;
+        if (pkt.len > l4_len || pkt.data > l4 + l4_len) {
+            return false;
+        }
     } else if (pkt.protocol == IPPROTO_UDP && l4_len >= sizeof(struct udphdr)) {
         struct udphdr* udp = reinterpret_cast<struct udphdr*>(l4);
         pkt.src_port = ntohs(udp->source);

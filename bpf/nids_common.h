@@ -366,8 +366,8 @@ struct {
 
 /* Fragment data buffer map - stores actual fragment data */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);  /* Max 8K fragment buffers */
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);  /* Max 16K fragment buffers, LRU auto-evicts */
     __type(key, __u32);         /* Buffer ID */
     __type(value, struct frag_data);
 } frag_buffers SEC(".maps");

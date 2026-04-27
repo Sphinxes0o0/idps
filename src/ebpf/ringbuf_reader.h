@@ -30,7 +30,8 @@ struct AlertEvent {
     uint8_t  severity;
     uint32_t rule_id;
     uint8_t  event_type;
-};
+    uint8_t  padding[3];  /* Match kernel layout: 32 bytes total */
+} __attribute__((packed));
 
 /*
  * 事件类型枚举

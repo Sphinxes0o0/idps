@@ -40,14 +40,14 @@ inline bool bmh_search(const uint8_t* text, size_t text_len,
     // 搜索
     size_t pos = 0;
     while (pos <= text_len - pat_len) {
-        size_t j = pat_len - 1;
+        int j = static_cast<int>(pat_len) - 1;
 
         // 从后往前比较
-        while (j < pat_len && pattern[j] == text[pos + j])
+        while (j >= 0 && static_cast<size_t>(j) < pat_len && pattern[j] == text[pos + j])
             j--;
 
-        if (j == pat_len) {
-            // 找到匹配
+        if (j < 0) {
+            // 所有字符都匹配了 (j 从 0 减到了 -1)
             return true;
         }
 

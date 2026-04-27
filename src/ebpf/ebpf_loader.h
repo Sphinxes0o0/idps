@@ -44,7 +44,8 @@ struct RuleEntry {
     uint16_t dst_port;   // 起始端口 (单端口或范围起始)
     uint16_t dst_port_max; // 范围结束端口 (0 = 单端口)
     uint8_t dpi_needed; // 0=不需要, 1=需要用户态 DPI
-};
+    uint8_t padding[2];  /* Match kernel layout: 12 bytes total */
+} __attribute__((packed));
 
 /*
  * 告警事件回调接口

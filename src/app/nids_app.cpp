@@ -34,6 +34,9 @@ AppConfig load_config(const std::string& path) {
             pcfg.iface = p.value("iface", "");
             pcfg.rules_file = p.value("rules_file", "");
             pcfg.ddos_threshold = p.value("ddos_threshold", 10000);
+            pcfg.window_size_ns = p.value("window_size_ns", 1000000000);
+            pcfg.enabled = p.value("enabled", 1);
+            pcfg.drop_enabled = p.value("drop_enabled", 0);
             pcfg.port_scan_threshold = p.value("port_scan_threshold", 20);
             pcfg.capture_cpu = p.value("capture_cpu", -1);
             cfg.pipelines.push_back(pcfg);
@@ -44,6 +47,9 @@ AppConfig load_config(const std::string& path) {
         pcfg.iface = j.value("interface", j.value("iface", ""));
         pcfg.rules_file = j.value("rules_file", "");
         pcfg.ddos_threshold = j.value("ddos_threshold", 10000);
+        pcfg.window_size_ns = j.value("window_size_ns", 1000000000);
+        pcfg.enabled = j.value("enabled", 1);
+        pcfg.drop_enabled = j.value("drop_enabled", 0);
         pcfg.port_scan_threshold = j.value("port_scan_threshold", 20);
         cfg.pipelines.push_back(pcfg);
     }
@@ -237,6 +243,9 @@ bool NidsApp::start() {
             // Push config to BPF maps
             NidsConfig cfg;
             cfg.ddos_threshold = pcfg.ddos_threshold;
+            cfg.window_size_ns = pcfg.window_size_ns;
+            cfg.enabled = pcfg.enabled;
+            cfg.drop_enabled = pcfg.drop_enabled;
             cfg.port_scan_threshold = pcfg.port_scan_threshold;
             ebpf_nic->set_config(cfg);
 

@@ -83,6 +83,7 @@ IDPS is a high-performance Network Intrusion Detection System using XDP/eBPF for
 | SYN Flood | `syn_flood_track` LRU_HASH | SYN flood detection per (src_ip, dst_ip, dst_port) |
 | ICMP Flood | `icmp_flood_track` LRU_HASH | ICMP flood detection per src_ip |
 | DNS Tracking | `dns_amp_track` | DNS amplification detection (single LRU table keyed by victim_ip) |
+| Port Scan | `port_scan_track` LRU_HASH | Port scan detection per (src_ip, dst_ip), tracks SYN/FIN/NULL/XMAS packets |
 | Frag Track | `frag_track`, `frag_buffers` | IPv4/IPv6 defragmentation |
 | XDP Pipeline | `xdp_jmp_table`, `xdp_ctx_buffer` | Tail call XDP pipeline |
 
@@ -97,6 +98,8 @@ IDPS is a high-performance Network Intrusion Detection System using XDP/eBPF for
 | SecEvent | `src/ipc/sec_event.h` | Security event structure |
 | CommThread | `src/threads/comm_thread.cpp` | Write events to JSON log (+syslog) |
 | RuleParser | `src/rules/rule_parser.cpp` | Parse Snort-like rules |
+| BMHSearch | `src/utils/bmh_search.h` | Boyer-Moore-Horspool pattern matching |
+| XdpProcessor | `src/xdp/af_xdp.cpp` | AF_XDP user-space DPI with TLS metadata extraction (version, SNI, cipher) |
 | BMHSearch | `src/utils/bmh_search.h` | Boyer-Moore-Horspool pattern matching |
 | XdpProcessor | `src/xdp/af_xdp.cpp` | AF_XDP for user-space DPI |
 | NidsApp | `src/app/nids_app.cpp` | Main app orchestrating all components |
@@ -192,6 +195,11 @@ sudo ./build/bin/nids eth0 rules.txt /tmp/events.json debug
 | `SYN_FLOOD` | 5 | SYN flood detected |
 | `ICMP_FLOOD` | 6 | ICMP flood detected |
 | `DNS_AMP` | 7 | DNS amplification attack detected |
+| `HTTP_DETECTED` | 8 | HTTP banner/response detected (port 80/8080) |
+| `SSH_BANNER` | 9 | SSH protocol banner detected (port 22) |
+| `FTP_CMD` | 10 | FTP command detected (port 21) |
+| `TELNET_OPT` | 11 | Telnet option negotiation detected (port 23) |
+| `PORT_SCAN` | 12 | Port scan detected (SYN/FIN/NULL/XMAS) |
 
 ## Testing
 

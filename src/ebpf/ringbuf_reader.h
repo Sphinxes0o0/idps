@@ -44,6 +44,11 @@ enum EventType {
     EVENT_SYN_FLOOD = 5,    /* SYN flood detected */
     EVENT_ICMP_FLOOD = 6,   /* ICMP flood detected */
     EVENT_DNS_AMP = 7,      /* DNS amplification detected */
+    EVENT_HTTP_DETECTED = 8, /* HTTP banner/response detected */
+    EVENT_SSH_BANNER = 9,   /* SSH protocol banner detected */
+    EVENT_FTP_CMD = 10,     /* FTP command detected */
+    EVENT_TELNET_OPT = 11,  /* Telnet option negotiation detected */
+    EVENT_PORT_SCAN = 12,   /* Port scan detected */
 };
 
 /*

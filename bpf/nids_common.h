@@ -22,6 +22,7 @@
 #define MAX_RULES 50000
 #define MAX_FLOWS 100000
 #define DDoS_THRESHOLD_DEFAULT 10000
+#define PORT_SCAN_THRESHOLD_DEFAULT 20
 #define WINDOW_SIZE_NS 1000000000ULL  /* 1 second in nanoseconds */
 
 /* 事件类型 */
@@ -34,6 +35,11 @@ enum event_type {
     EVENT_SYN_FLOOD = 5,    /* SYN flood detected */
     EVENT_ICMP_FLOOD = 6,   /* ICMP flood detected */
     EVENT_DNS_AMP = 7,      /* DNS amplification detected */
+    EVENT_HTTP_DETECTED = 8,
+    EVENT_SSH_BANNER = 9,
+    EVENT_FTP_CMD = 10,
+    EVENT_TELNET_OPT = 11,
+    EVENT_PORT_SCAN = 12,
 };
 
 /* 告警严重级别 */
@@ -149,6 +155,7 @@ struct config_entry {
     __u32 window_size_ns;
     __u32 enabled;
     __u32 drop_enabled;  /* 运行时可配置 */
+    __u32 port_scan_threshold;
 };
 
 /* 统计计数器索引 */
@@ -162,6 +169,11 @@ enum stats_index {
     STATS_SYN_FLOOD_ALERTS = 6,
     STATS_ICMP_FLOOD_ALERTS = 7,
     STATS_DNS_AMP_ALERTS = 8,
+    STATS_HTTP_DETECTED = 9,
+    STATS_SSH_BANNER = 10,
+    STATS_FTP_CMD = 11,
+    STATS_TELNET_OPT = 12,
+    STATS_PORT_SCAN_ALERTS = 13,
     STATS_MAX = 256,
 };
 
@@ -356,6 +368,35 @@ struct {
     __type(key, struct dns_amp_key);
     __type(value, struct dns_amp_stats);
 } dns_amp_track SEC(".maps");
+
+/* Port scan detection - scan type flags */
+#define SCAN_TYPE_SYN 0x01
+#define SCAN_TYPE_FIN_NULL 0x02
+#define SCAN_TYPE_XMAS 0x04
+
+/* port_scan_key - Port scan tracking key (src_ip, dst_ip) */
+struct port_scan_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+};
+
+/* port_scan_stats - Port scan tracking statistics */
+struct port_scan_stats {
+    __u64 window_start;
+    __u64 last_seen;
+    __u32 packet_count;
+    __u8 scan_type_mask;
+    __u8 alert_sent;
+    __u8 padding[2];
+};
+
+/* Port scan tracking table - LRU Hash */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct port_scan_key);
+    __type(value, struct port_scan_stats);
+} port_scan_track SEC(".maps");
 
 /* 规则索引 key: (protocol << 16) | dst_port */
 struct rule_index_key {

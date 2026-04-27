@@ -108,6 +108,11 @@ std::string alert_to_string(const AlertEvent& event) {
         case EVENT_SYN_FLOOD: event_type_str = "SYN_FLOOD"; break;
         case EVENT_ICMP_FLOOD: event_type_str = "ICMP_FLOOD"; break;
         case EVENT_DNS_AMP: event_type_str = "DNS_AMP"; break;
+        case EVENT_HTTP_DETECTED: event_type_str = "HTTP_DETECTED"; break;
+        case EVENT_SSH_BANNER: event_type_str = "SSH_BANNER"; break;
+        case EVENT_FTP_CMD: event_type_str = "FTP_CMD"; break;
+        case EVENT_TELNET_OPT: event_type_str = "TELNET_OPT"; break;
+        case EVENT_PORT_SCAN: event_type_str = "PORT_SCAN"; break;
         default: event_type_str = "UNKNOWN"; break;
     }
 

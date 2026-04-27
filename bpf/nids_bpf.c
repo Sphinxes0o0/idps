@@ -22,6 +22,7 @@
  */
 const volatile __u32 ddos_threshold = DDoS_THRESHOLD_DEFAULT;
 const volatile __u32 enabled = 1;
+const volatile __u32 port_scan_threshold = PORT_SCAN_THRESHOLD_DEFAULT;
 
 /* 全局规则匹配标志 */
 const volatile __u32 match_rules_enabled = 1;
@@ -918,6 +919,123 @@ static __always_inline int check_dns_amplification(__u32 src_ip, __u32 dst_ip,
     return 0;
 }
 
+/*
+ * Port Scan Detection
+ * Detects various port scan types:
+ *   - SYN scan (0x02): TCP SYN to multiple ports
+ *   - FIN/NULL scan (0x00 or 0x01): TCP with no flags or just FIN
+ *   - XMAS scan (0x29): TCP with FIN+URG+PUSH flags
+ * Returns: 0=normal, 1=port scan detected
+ */
+static __always_inline int check_port_scan(__u32 src_ip, __u32 dst_ip,
+                                           __u16 dst_port, __u8 tcp_flags) {
+    struct port_scan_key ps_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+    };
+    struct port_scan_stats *ps_stats = bpf_map_lookup_elem(&port_scan_track, &ps_key);
+    __u64 now = bpf_ktime_get_ns();
+    __u8 scan_type = 0;
+
+    /* Determine scan type based on TCP flags */
+    if (tcp_flags & 0x02) {
+        /* SYN flag set - could be SYN scan */
+        if ((tcp_flags & 0x17) == 0x02) {
+            /* Only SYN flag (no ACK, RST, etc.) - SYN scan */
+            scan_type = SCAN_TYPE_SYN;
+        }
+    } else if ((tcp_flags & 0x29) == 0x29) {
+        /* XMAS scan: FIN+URG+PUSH flags set */
+        scan_type = SCAN_TYPE_XMAS;
+    } else if ((tcp_flags & 0x01) == 0x00 || (tcp_flags & 0x01) == 0x01) {
+        /* FIN or NULL scan: no flags or only FIN */
+        scan_type = SCAN_TYPE_FIN_NULL;
+    }
+
+    /* If not a scan packet, ignore */
+    if (scan_type == 0)
+        return 0;
+
+    if (!ps_stats) {
+        /* New entry */
+        struct port_scan_stats new_ps = {
+            .window_start = now,
+            .last_seen = now,
+            .packet_count = 1,
+            .scan_type_mask = scan_type,
+            .alert_sent = 0,
+        };
+        bpf_map_update_elem(&port_scan_track, &ps_key, &new_ps, BPF_ANY);
+        return 0;
+    }
+
+    /* Update existing entry */
+    if (now - ps_stats->window_start >= WINDOW_SIZE_NS) {
+        /* Reset window */
+        ps_stats->window_start = now;
+        ps_stats->packet_count = 1;
+        ps_stats->scan_type_mask = scan_type;
+    } else {
+        ps_stats->packet_count++;
+        ps_stats->scan_type_mask |= scan_type;
+    }
+    ps_stats->last_seen = now;
+
+    /* Check threshold */
+    if (ps_stats->packet_count >= port_scan_threshold && !ps_stats->alert_sent) {
+        /* Send port scan alert */
+        send_alert(src_ip, dst_ip, 0, dst_port,
+                   IPPROTO_TCP, SEVERITY_HIGH,
+                   0, EVENT_PORT_SCAN);
+        increment_stat(STATS_PORT_SCAN_ALERTS, 1);
+        ps_stats->alert_sent = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Check if payload starts with HTTP/ (HTTP response/request line)
+ */
+static __always_inline int check_http(const __u8 *payload, __u32 payload_len) {
+    if (payload_len < 5) return 0;
+    /* Boyer-Moore-Horspool style: check "HTTP/" at start */
+    if (payload[0] == 'H' && payload[1] == 'T' && payload[2] == 'T' && payload[3] == 'P' && payload[4] == '/') return 1;
+    return 0;
+}
+
+/*
+ * Check if payload starts with "SSH-" (SSH protocol banner)
+ */
+static __always_inline int check_ssh(const __u8 *payload, __u32 payload_len) {
+    if (payload_len < 4) return 0;
+    if (payload[0] == 'S' && payload[1] == 'S' && payload[2] == 'H' && payload[3] == '-') return 1;
+    return 0;
+}
+
+/*
+ * Check for FTP command (3 uppercase letters followed by space or \r)
+ * Common FTP commands: USER, PASS, LIST, RETR, STOR, CWD, PWD, QUIT, PORT, PASV, etc.
+ */
+static __always_inline int check_ftp(const __u8 *payload, __u32 payload_len) {
+    if (payload_len < 4) return 0;
+    /* Check if first 3 bytes are uppercase ASCII letters */
+    if (payload[0] >= 'A' && payload[0] <= 'Z' &&
+        payload[1] >= 'A' && payload[1] <= 'Z' &&
+        payload[2] >= 'A' && payload[2] <= 'Z') return 1;
+    return 0;
+}
+
+/*
+ * Check for Telnet option negotiation (IAC = 0xFF followed by command byte)
+ */
+static __always_inline int check_telnet(const __u8 *payload, __u32 payload_len) {
+    if (payload_len < 2) return 0;
+    if (payload[0] == 0xFF && payload[1] >= 0xF0) return 1; /* IAC + command (WILL/WONT/DO/DONT) */
+    return 0;
+}
+
 /* Forward declaration for handle_xdp (used by tail_call_dispatch) */
 static __always_inline int handle_xdp(struct xdp_md *ctx);
 
@@ -1011,6 +1129,11 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
         check_syn_flood(key.src_ip, key.dst_ip, key.dst_port, tcp_flags);
     }
 
+    /* Port scan detection (TCP with SYN, FIN, NULL, or XMAS flags) */
+    if (key.protocol == IPPROTO_TCP) {
+        check_port_scan(key.src_ip, key.dst_ip, key.dst_port, tcp_flags);
+    }
+
     /* ICMP flood 检测 */
     if (key.protocol == IPPROTO_ICMP) {
         check_icmp_flood(key.src_ip);
@@ -1020,6 +1143,56 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     if (key.protocol == IPPROTO_UDP) {
         check_dns_amplification(key.src_ip, key.dst_ip,
                                 key.src_port, key.dst_port, pkt_len);
+    }
+
+    /* Protocol detection for TCP with payload */
+    if (key.protocol == IPPROTO_TCP) {
+        /* Extract TCP payload pointer and length */
+        struct ethhdr *eth = (struct ethhdr *)data;
+        struct iphdr *ip = (struct iphdr *)(eth + 1);
+        __u32 ip_header_len = ip->ihl * 4;
+        struct tcphdr *tcp = (struct tcphdr *)((__u8 *)ip + ip_header_len);
+        if ((void *)(tcp + 1) <= data_end) {
+            __u32 tcp_header_len = tcp->doff * 4;
+            __u8 *payload = (__u8 *)tcp + tcp_header_len;
+            __u32 payload_len = pkt_len - sizeof(struct ethhdr) - ip_header_len - tcp_header_len;
+
+            /* Only check if we have payload */
+            if (payload_len > 0 && payload_len <= pkt_len) {
+                /* HTTP detection on ports 80, 8080 */
+                if (key.dst_port == 80 || key.dst_port == 8080) {
+                    if (check_http(payload, payload_len)) {
+                        send_alert(key.src_ip, key.dst_ip, key.src_port, key.dst_port,
+                                   IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_HTTP_DETECTED);
+                        increment_stat(STATS_HTTP_DETECTED, 1);
+                    }
+                }
+                /* SSH detection on port 22 */
+                if (key.dst_port == 22) {
+                    if (check_ssh(payload, payload_len)) {
+                        send_alert(key.src_ip, key.dst_ip, key.src_port, key.dst_port,
+                                   IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_SSH_BANNER);
+                        increment_stat(STATS_SSH_BANNER, 1);
+                    }
+                }
+                /* FTP detection on port 21 */
+                if (key.dst_port == 21) {
+                    if (check_ftp(payload, payload_len)) {
+                        send_alert(key.src_ip, key.dst_ip, key.src_port, key.dst_port,
+                                   IPPROTO_TCP, SEVERITY_MEDIUM, 0, EVENT_FTP_CMD);
+                        increment_stat(STATS_FTP_CMD, 1);
+                    }
+                }
+                /* Telnet detection on port 23 */
+                if (key.dst_port == 23) {
+                    if (check_telnet(payload, payload_len)) {
+                        send_alert(key.src_ip, key.dst_ip, key.src_port, key.dst_port,
+                                   IPPROTO_TCP, SEVERITY_MEDIUM, 0, EVENT_TELNET_OPT);
+                        increment_stat(STATS_TELNET_OPT, 1);
+                    }
+                }
+            }
+        }
     }
 
     /* 归一化流 key，确保 (A→B) 和 (B→A) 使用同一 entry */

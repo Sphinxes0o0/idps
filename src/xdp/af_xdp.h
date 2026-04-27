@@ -118,10 +118,48 @@ public:
     uint64_t get_drop_count() const { return drop_count_; }
     uint64_t get_dpi_match_count() const { return dpi_match_count_; }
 
+    /**
+     * @brief 添加 TLS 版本规则 (weak TLS detection)
+     */
+    void add_tls_version_rule(uint16_t version, int rule_id, const std::string& message) {
+        tls_version_rules_.push_back({version, rule_id, message});
+    }
+
+    /**
+     * @brief 添加 SNI hostname 规则 (TLS SNI blocklist)
+     */
+    void add_sni_rule(const std::string& sni_pattern, int rule_id, const std::string& message) {
+        sni_rules_.push_back({sni_pattern, rule_id, message});
+    }
+
+    /**
+     * @brief 添加 cipher suite 规则
+     */
+    void add_cipher_rule(uint16_t cipher, int rule_id, const std::string& message) {
+        cipher_rules_.push_back({cipher, rule_id, message});
+    }
+
 private:
     void process_packets();
     bool parse_packet(uint8_t* data, uint32_t len, XdpPacket& pkt);
     void perform_dpi(const XdpPacket& pkt);
+
+    /* TLS detection types */
+    struct TlsInfo {
+        bool is_tls = false;
+        uint16_t version = 0;
+        uint8_t handshake_type = 0;
+        std::string sni;
+        uint16_t cipher_suite = 0;
+        bool weak_version = false;
+    };
+
+    bool parse_tls_record(const uint8_t* data, size_t len, TlsInfo& info);
+    void detect_tls(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len);
+
+    struct TlsVersionRule { uint16_t version; int rule_id; std::string message; };
+    struct SniRule { std::string pattern; int rule_id; std::string message; };
+    struct CipherRule { uint16_t cipher; int rule_id; std::string message; };
 
     int sock_fd_;
     bool opened_;
@@ -133,6 +171,10 @@ private:
     uint64_t rx_count_;
     uint64_t drop_count_;
     uint64_t dpi_match_count_;
+
+    std::vector<TlsVersionRule> tls_version_rules_;
+    std::vector<SniRule> sni_rules_;
+    std::vector<CipherRule> cipher_rules_;
 };
 
 } // namespace nids

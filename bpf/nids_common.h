@@ -335,20 +335,7 @@ struct {
     __type(value, struct src_track);
 } icmp_flood_track SEC(".maps");
 
-/* DNS query tracking - key: (src_ip, dst_ip) */
-struct dns_query_key {
-    __u32 src_ip;
-    __u32 dst_ip;
-};
-
-/* DNS query stats */
-struct dns_query_stats {
-    __u64 query_count;
-    __u64 query_bytes;
-    __u64 last_seen;
-};
-
-/* DNS amplification tracking - key: victim dst_ip */
+/* DNS amplification tracking - key: victim IP */
 struct dns_amp_key {
     __u32 victim_ip;
 };
@@ -362,15 +349,7 @@ struct dns_amp_stats {
     __u8 padding[7];
 };
 
-/* DNS query 跟踪表 - LRU Hash */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct dns_query_key);
-    __type(value, struct dns_query_stats);
-} dns_query_track SEC(".maps");
-
-/* DNS amplification 跟踪表 - LRU Hash */
+/* DNS amplification 跟踪表 - LRU Hash (单表统一跟踪 query 和 response 都以 victim_ip 为 key) */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
@@ -463,19 +442,10 @@ struct {
     __type(value, struct frag_data);
 } frag_buffers SEC(".maps");
 
-/* Per-CPU fragment counter for limiting concurrent reassemblies */
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} frag_count SEC(".maps");
-
 /* Defragmentation constants */
 #define FRAG_TIMEOUT_NS 30000000000ULL    /* 30 seconds timeout */
 #define FRAG_MAX_SIZE 65535               /* Max reassembled packet size */
 #define FRAG_MIN_SIZE 8                   /* Minimum fragment size (8-byte aligned) */
-#define FRAG_MAX_CONCURRENT 256           /* Max concurrent reassemblies per CPU */
 #define FRAG_BUFFER_SIZE 128              /* Size of each fragment buffer entry */
 
 #endif /* NIDS_COMMON_H */

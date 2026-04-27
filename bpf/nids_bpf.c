@@ -260,104 +260,6 @@ static __always_inline int is_ipv4_more_fragments(struct iphdr *ip) {
 }
 
 /*
- * 处理 IPv4 分片
- *
- * @return XDP_PASS 继续处理, XDP_DROP 丢弃, negative 错误
- */
-static __always_inline int handle_ipv4_fragment(struct xdp_md *ctx,
-                                                struct iphdr *ip,
-                                                void *data_end) {
-    __u64 now = bpf_ktime_get_ns();
-
-    /* 构造 fragment key */
-    struct frag_key fkey = {};
-    fkey.src_ip = ip->saddr;
-    fkey.dst_ip = ip->daddr;
-    fkey.ip_id = ip->id;
-    fkey.protocol = ip->protocol;
-    fkey.ip_version = 4;
-
-    /* 查找已存在的 fragment 链 */
-    struct frag_entry *entry = bpf_map_lookup_elem(&frag_track, &fkey);
-
-    /* 检查超时，清理过期分片 */
-    if (entry && now - entry->last_seen > FRAG_TIMEOUT_NS) {
-        bpf_map_delete_elem(&frag_track, &fkey);
-        entry = NULL;
-    }
-
-    if (!entry) {
-        /* 新 fragment 链 - 这是第一个分片 */
-        struct frag_entry new_entry = {};
-        new_entry.first_seen = now;
-        new_entry.last_seen = now;
-        new_entry.total_length = (__u32)bpf_ntohs(ip->tot_len);
-        new_entry.fragment_count = 1;
-        new_entry.more_fragments = is_ipv4_more_fragments(ip);
-
-        /* 检查并发分片限制 */
-        __u32 count_key = 0;
-        __u32 *frag_count = bpf_map_lookup_elem(&frag_count, &count_key);
-        if (frag_count && *frag_count >= FRAG_MAX_CONCURRENT) {
-            /* 太多并发分片，丢弃这个新分片 */
-            increment_stat(STATS_PACKETS_DROPPED, 1);
-            return XDP_DROP;
-        }
-
-        bpf_map_update_elem(&frag_track, &fkey, &new_entry, BPF_ANY);
-        if (frag_count) {
-            (*frag_count)++;
-        }
-
-        increment_stat(STATS_PACKETS_PASSED, 1);
-        return XDP_PASS;  /* 第一个分片，暂不重组 */
-    }
-
-    /* 更新已存在的 fragment 链 */
-    entry->last_seen = now;
-    entry->fragment_count++;
-
-    /* 检查是否完整 (收到 MF=0 的分片) */
-    if (!is_ipv4_more_fragments(ip)) {
-        entry->complete = 1;
-    }
-
-    /* 简化处理: 让所有分片通过，在用户态进行完整重组
-     * BPF 中进行完整的分片重组太复杂且受限于 verifier
-     */
-    increment_stat(STATS_PACKETS_PASSED, 1);
-    return XDP_PASS;
-}
-
-/*
- * 处理 IPv6 分片 (简化版本)
- */
-static __always_inline int handle_ipv6_fragment(struct xdp_md *ctx,
-                                               struct ipv6hdr *ipv6,
-                                               void *data_end) {
-    /* IPv6 分片处理需要解析扩展头链，比较复杂
-     * 这里简化处理：只检查是否存在分片头，让分片通过
-     * 完整的 IPv6 分片重组需要用户态或 socket 层处理
-     */
-    __u8 *next_hdr = (__u8 *)ipv6 + sizeof(struct ipv6hdr);
-
-    /* 检查下一个头是否为分片头 (44) */
-    if ((void *)next_hdr >= data_end) {
-        increment_stat(STATS_PACKETS_PASSED, 1);
-        return XDP_PASS;
-    }
-
-    if (*next_hdr == 44) {  /* IPv6 Fragment Header */
-        /* 记录分片事件，但不阻止分片通过 */
-        increment_stat(STATS_PACKETS_PASSED, 1);
-        return XDP_PASS;
-    }
-
-    increment_stat(STATS_PACKETS_PASSED, 1);
-    return XDP_PASS;
-}
-
-/*
  * 解析以太网 + IPv4 + TCP/UDP/ICMP 头
  * 直接从 XDP 帧访问，不依赖 skb
  *
@@ -946,35 +848,37 @@ static __always_inline int check_dns_amplification(__u32 src_ip, __u32 dst_ip,
     __u64 now = bpf_ktime_get_ns();
 
     if (dst_port == 53 && src_port != 53) {
-        /* DNS 查询: 记录查询字节数 */
-        struct dns_query_key q_key = {
-            .src_ip = src_ip,
-            .dst_ip = dst_ip,
+        /* DNS 查询: attacker→DNS server (victim IP is spoofed as src_ip)
+         * 统一用 victim_ip (src_ip) 作为 key 跟踪，因为响应也发往 src_ip */
+        struct dns_amp_key q_key = {
+            .victim_ip = src_ip,  /* victim = spoofed source = 攻击目标 */
         };
-        struct dns_query_stats *q_stats = bpf_map_lookup_elem(&dns_query_track, &q_key);
+        struct dns_amp_stats *q_stats = bpf_map_lookup_elem(&dns_amp_track, &q_key);
 
         if (!q_stats) {
-            struct dns_query_stats new_q = {
-                .query_count = 1,
+            struct dns_amp_stats new_q = {
+                .response_bytes = 0,
                 .query_bytes = pkt_len,
                 .last_seen = now,
+                .alert_sent = 0,
             };
-            bpf_map_update_elem(&dns_query_track, &q_key, &new_q, BPF_ANY);
+            bpf_map_update_elem(&dns_amp_track, &q_key, &new_q, BPF_ANY);
         } else {
             if (now - q_stats->last_seen >= WINDOW_SIZE_NS) {
-                q_stats->query_count = 1;
                 q_stats->query_bytes = pkt_len;
+                q_stats->response_bytes = 0;
                 q_stats->last_seen = now;
+                q_stats->alert_sent = 0;
             } else {
-                q_stats->query_count++;
                 q_stats->query_bytes += pkt_len;
                 q_stats->last_seen = now;
             }
         }
     } else if (src_port == 53 && dst_port != 53) {
-        /* DNS 响应: 检查是否是放大攻击 */
+        /* DNS 响应: DNS server→victim (dst_ip = victim)
+         * victim IP 在 dst_ip 位置 */
         struct dns_amp_key a_key = {
-            .victim_ip = dst_ip,
+            .victim_ip = dst_ip,  /* 受害者是响应包的目的地 */
         };
         struct dns_amp_stats *a_stats = bpf_map_lookup_elem(&dns_amp_track, &a_key);
 

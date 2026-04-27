@@ -285,52 +285,6 @@ struct {
     __uint(max_entries, 256 * 1024);  /* 256KB ring buffer */
 } events SEC(".maps");
 
-/*
- * XDP Tail Call Pipeline
- *
- * Stage indices:
- *   0 = PARSER   - Parse packet and extract 5-tuple
- *   1 = DDOS     - SYN/ICMP flood detection
- *   2 = DNS_AMP  - DNS amplification detection
- *   3 = RULES    - Rule matching
- *
- * To enable tail call mode, populate xdp_jmp_table with program fds:
- *   bpf_map_update_elem(map_fd, 0, parser_prog_fd, BPF_ANY);
- *   bpf_map_update_elem(map_fd, 1, ddos_prog_fd, BPF_ANY);
- *   bpf_map_update_elem(map_fd, 2, dns_amp_prog_fd, BPF_ANY);
- *   bpf_map_update_elem(map_fd, 3, rules_prog_fd, BPF_ANY);
- */
-struct {
-    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 4);  /* 4 pipeline stages */
-} xdp_jmp_table SEC(".maps");
-
-/*
- * Per-CPU context buffer for passing state between tail-called stages.
- * Each stage reads from this buffer and writes intermediate results.
- */
-struct xdp_pipeline_ctx {
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u8  protocol;
-    __u8  ip_version;
-    __u32 pkt_len;
-    __u8  tcp_flags;
-    __u8  stage;         /* Current stage (0-3) */
-    __u8  action;        /* 0=pass, 1=drop, 2=alert */
-    __u32 rule_id;
-    __u8  verdict;       /* Final XDP verdict */
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct xdp_pipeline_ctx);
-} xdp_ctx_buffer SEC(".maps");
-
 /* SYN flood 跟踪表 - LRU Hash (key = syn_flood_key) */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);

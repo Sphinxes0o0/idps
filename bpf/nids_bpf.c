@@ -1036,55 +1036,7 @@ static __always_inline int check_telnet(const __u8 *payload, __u32 payload_len) 
     return 0;
 }
 
-/* Forward declaration for handle_xdp (used by tail_call_dispatch) */
-static __always_inline int handle_xdp(struct xdp_md *ctx);
-
-/*
- * Tail call dispatch - jumps to first stage in pipeline via xdp_jmp_table
- *
- * Stage indices in xdp_jmp_table:
- *   0 = PARSER   - Parse packet and extract 5-tuple
- *   1 = DDOS     - SYN/ICMP flood detection
- *   2 = DNS_AMP  - DNS amplification detection
- *   3 = RULES    - Rule matching
- *
- * Uses per-CPU xdp_ctx_buffer to pass state between stages.
- */
-static __always_inline int tail_call_dispatch(struct xdp_md *ctx) {
-    void *data = (void *)(long)ctx->data;
-    void *data_end = (void *)(long)ctx->data_end;
-
-    /* Initialize per-CPU context buffer */
-    __u32 ctx_key = 0;
-    struct xdp_pipeline_ctx *pctx = bpf_map_lookup_elem(&xdp_ctx_buffer, &ctx_key);
-    if (!pctx)
-        return XDP_PASS;  /* Fallback to normal path if context unavailable */
-
-    __builtin_memset(pctx, 0, sizeof(*pctx));
-
-    /* Parse packet into context buffer */
-    int ret = parse_packet(data, data_end,
-                          (struct flow_key *)pctx,  /* Reuse ctx fields as flow_key */
-                          &pctx->pkt_len, &pctx->tcp_flags);
-    if (ret != 0) {
-        increment_stat(STATS_PACKETS_PASSED, 1);
-        return XDP_PASS;
-    }
-
-    /* Initialize pipeline context */
-    pctx->stage = 0;
-    pctx->verdict = XDP_PASS;
-
-    /* Tail call to first stage (parser) */
-    bpf_tail_call(ctx, &xdp_jmp_table, 0);
-
-    /* If no tail call target, fall through to normal processing */
-    return handle_xdp(ctx);
-}
-
-/*
- * XDP 主程序
- */
+/* XDP 主程序 - 直接处理，不使用 tail call */
 static __always_inline int handle_xdp(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;

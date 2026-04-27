@@ -288,15 +288,16 @@ static __always_inline int parse_packet(void *data, void *data_end,
 
         return 0;
     } else if (eth_proto == ETH_P_IPV6) {
-        /* IPv6 — 暂不支持深度检测，记录统计后放行 */
+        /* IPv6 — 使用第一个 32 位块作为 IPv4 兼容的流标识 */
         struct ipv6hdr *ipv6 = (struct ipv6hdr *)(eth + 1);
         if ((void *)(ipv6 + 1) > data_end)
             return -1;
 
-        key->src_ip = 0;  /* IPv6 不兼容 IPv4 */
-        key->dst_ip = 0;
+        /* 使用第一个 32 位块用于流跟踪（截断可接受用于检测） */
+        key->src_ip = ipv6->saddr.in6_u.u6_addr32[0];
+        key->dst_ip = ipv6->daddr.in6_u.u6_addr32[0];
         key->protocol = ipv6->nexthdr;
-        *pkt_len = bpf_ntohs(ipv6->payload_len);
+        *pkt_len = bpf_ntohs(ipv6->payload_len) + sizeof(struct ipv6hdr);
 
         /* 初始化 tcp_flags */
         *tcp_flags = 0;
@@ -740,7 +741,7 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
     /* Get fragment header info */
     struct frag_hdr *frag = (struct frag_hdr *)((void *)ipv6 + sizeof(struct ipv6hdr));
     frag_offset = bpf_ntohs(frag->frag_off) & 0x1FFF;  /* 13-bit offset in 8-byte units */
-    more_fragments = frag->frag_off & 0x01;  /* M flag is bit 0 after 13-bit offset */
+    more_fragments = (bpf_ntohs(frag->frag_off) >> 15) & 1;  /* M flag is bit 15 */
     ip_id = bpf_ntohl(frag->identification);
 
     /* This is a fragment - look up tracking entry */
@@ -987,8 +988,11 @@ static __always_inline int check_port_scan(__u32 src_ip, __u32 dst_ip,
     } else if ((tcp_flags & 0x29) == 0x29) {
         /* XMAS scan: FIN+URG+PUSH flags set */
         scan_type = SCAN_TYPE_XMAS;
-    } else if ((tcp_flags & 0x01) == 0x00 || (tcp_flags & 0x01) == 0x01) {
-        /* FIN or NULL scan: no flags or only FIN */
+    } else if (tcp_flags == 0x01) {
+        /* FIN scan: only FIN flag set */
+        scan_type = SCAN_TYPE_FIN_NULL;
+    } else if (tcp_flags == 0) {
+        /* NULL scan: no TCP flags set */
         scan_type = SCAN_TYPE_FIN_NULL;
     }
 
@@ -1375,4 +1379,4 @@ int nids_xdp(struct xdp_md *ctx) {
  * license - 必需的 license 声明
  * GPL 是使用某些 BPF helper 的前提
  */
-char LICENSE[] SEC("license") = "MIT";
+char LICENSE[] SEC("license") = "GPL";

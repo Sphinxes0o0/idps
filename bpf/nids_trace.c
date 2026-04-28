@@ -12,6 +12,7 @@
  */
 
 #include "nids_common.h"
+#include "bpf_tracing.h"
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <linux/ptrace.h>
@@ -20,7 +21,19 @@
 #include <linux/in.h>
 #include <linux/in6.h>
 
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
 #define TASK_COMM_LEN 16
+
+/* Forward declarations for helper functions used in tracepoint handlers */
+static __always_inline void update_fd_count(__u32 pid, __u8 type, int increment);
+static __always_inline __u8 get_fd_type(__u32 pid, __u32 fd);
+static __always_inline void remove_fd_type(__u32 pid, __u32 fd);
 
 enum proc_event_type {
     PROC_EVENT_CONNECT = 0,
@@ -35,9 +48,9 @@ struct proc_trace_event {
     __u8 event_type;
     __u8 padding1[3];
     __u8 padding2[4];
-    pid_t pid;
-    pid_t tid;
-    uid_t uid;
+    __u32 pid;
+    __u32 tid;
+    __u32 uid;
     char comm[TASK_COMM_LEN];
     int fd;
     __u32 saddr;
@@ -69,7 +82,7 @@ static __always_inline int send_process_event_ringbuf(__u32 pid, __u32 tid, __u3
                                                      __u16 src_port, __u16 dst_port) {
     struct process_event *event;
 
-    event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    event = bpf_ringbuf_reserve(&process_events, sizeof(*event), 0);
     if (!event) {
         return -1;
     }
@@ -91,8 +104,7 @@ static __always_inline int send_process_event_ringbuf(__u32 pid, __u32 tid, __u3
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_connect")
-int tracepoint_sys_enter_connect(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
 {
     __u32 pid, tid, uid;
     __u32 fd;
@@ -107,10 +119,10 @@ int tracepoint_sys_enter_connect(struct trace_event_raw_sys_enter *ctx)
     tid = (__u32)(pid_tgid & 0xFFFFFFFF);
 
     __u32 uid_gid = bpf_get_current_uid_gid();
-    uid = uid_gid >> 32;
+    uid = uid_gid >> 16;
 
-    fd = (__u32)ctx->args[0];
-    sockaddr_ptr = (void *)ctx->args[1];
+    fd = (__u32)PT_REGS_PARM1(ctx);
+    sockaddr_ptr = (void *)PT_REGS_PARM2(ctx);
 
     if (sockaddr_ptr) {
         __u16 family;
@@ -155,10 +167,12 @@ int tracepoint_sys_enter_connect(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
+BPF_TRACE_sys_enter(connect, handle_connect_enter);
+
 struct accept_event {
-    pid_t pid;
-    pid_t tid;
-    uid_t uid;
+    __u32 pid;
+    __u32 tid;
+    __u32 uid;
     char comm[TASK_COMM_LEN];
     int listen_fd;
     int new_fd;
@@ -182,14 +196,13 @@ struct {
     __type(value, __u64);
 } accept_pending SEC(".maps");
 
-SEC("tracepoint/syscalls/sys_enter_accept")
-int tracepoint_sys_enter_accept(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_accept_enter(struct trace_event_raw_sys_enter *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 tid = (__u32)pid_tgid;
 
-    __u64 key = (__u64)tid << 32 | (__u64)ctx->args[0];
+    __u64 key = (__u64)tid << 32 | (__u64)PT_REGS_PARM1(ctx);
     __u64 val = bpf_ktime_get_ns();
 
     bpf_map_update_elem(&accept_pending, &key, &val, BPF_ANY);
@@ -197,36 +210,9 @@ int tracepoint_sys_enter_accept(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_exit_accept")
-int tracepoint_sys_exit_accept(struct trace_event_raw_sys_exit *ctx)
-{
-    struct accept_event event = {};
+BPF_TRACE_sys_enter(accept, handle_accept_enter);
 
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    event.pid = pid_tgid >> 32;
-    event.tid = (__u32)pid_tgid;
-    event.uid = bpf_get_current_uid_gid();
-    bpf_get_current_comm(&event.comm, sizeof(event.comm));
-
-    int ret = ctx->ret;
-    if (ret < 0) {
-        return 0;
-    }
-
-    event.new_fd = ret;
-    event.listen_fd = ctx->args[0];
-    event.protocol = IPPROTO_TCP;
-    event.timestamp = bpf_ktime_get_ns();
-
-    __u64 key = (__u64)event.tid << 32 | (__u64)event.listen_fd;
-    bpf_map_delete_elem(&accept_pending, &key);
-
-    send_accept_event(&event);
-    return 0;
-}
-
-SEC("tracepoint/syscalls/sys_enter_close")
-int tracepoint_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 {
     __u32 pid, tid, uid;
     __u32 fd;
@@ -236,18 +222,25 @@ int tracepoint_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
     tid = (__u32)(pid_tgid & 0xFFFFFFFF);
 
     __u32 uid_gid = bpf_get_current_uid_gid();
-    uid = uid_gid >> 32;
+    uid = uid_gid >> 16;
 
-    fd = (__u32)ctx->args[0];
+    fd = (__u32)PT_REGS_PARM1(ctx);
 
     send_process_event_ringbuf(pid, tid, uid, fd, EVENT_PROCESS_CLOSE,
                               0, 0, 0, 0, 0, 0);
 
+    __u8 type = get_fd_type(pid, fd);
+    if (type != FD_TYPE_UNKNOWN) {
+        update_fd_count(pid, type, 0);
+        remove_fd_type(pid, fd);
+    }
+
     return 0;
 }
 
-SEC("tracepoint/sched/sched_process_exit")
-int tracepoint_sched_process_exit(struct trace_event_raw_sched_process_template *ctx)
+BPF_TRACE_sys_enter(close, handle_close_enter);
+
+static __always_inline int handle_sched_process_exit(struct trace_event_raw_sched_process_template *ctx)
 {
     struct proc_trace_event event = {};
 
@@ -263,6 +256,8 @@ int tracepoint_sched_process_exit(struct trace_event_raw_sched_process_template 
     send_proc_trace_event(&event);
     return 0;
 }
+
+BPF_TRACE_sched_process_exit();
 
 /*
  * Memory tracking structures
@@ -283,7 +278,7 @@ struct {
     __type(value, struct mem_track);
 } mem_monitor SEC(".maps");
 
-static __always_inline void update_mem_track(__u32 pid, __u64 bytes, bool alloc)
+static __always_inline void update_mem_track(__u32 pid, __u64 bytes, __u8 alloc)
 {
     struct mem_track *track;
     struct mem_track zero = {};
@@ -310,25 +305,27 @@ static __always_inline void update_mem_track(__u32 pid, __u64 bytes, bool alloc)
     }
 }
 
-SEC("tracepoint/kmem/kmalloc")
-int handle_kmalloc(struct trace_event_raw_kmalloc *ctx)
+static __always_inline int handle_kmalloc(struct trace_event_raw_kmalloc *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     __u64 bytes = ctx->bytes_alloc;
 
-    update_mem_track(pid, bytes, true);
+    update_mem_track(pid, bytes, 1);
     return 0;
 }
 
-SEC("tracepoint/mm/mm_page_alloc")
-int handle_mm_page_alloc(struct trace_event_raw_mm_page_alloc *ctx)
+BPF_TRACE_kmem_kmalloc();
+
+static __always_inline int handle_mm_page_alloc(struct trace_event_raw_mm_page_alloc *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     __u64 bytes = ctx->page_size;
 
-    update_mem_track(pid, bytes, true);
+    update_mem_track(pid, bytes, 1);
     return 0;
 }
+
+BPF_TRACE_mm_page_alloc();
 
 /*
  * CPU tracking via sched tracepoints
@@ -365,8 +362,7 @@ static __always_inline void update_cpu_track(__u32 pid, __u64 cpu_ns)
     track->last_update = bpf_ktime_get_ns();
 }
 
-SEC("tracepoint/sched/sched_process_fork")
-int handle_sched_process_fork(struct trace_event_raw_sched_process_template *ctx)
+static __always_inline int handle_sched_process_fork(struct trace_event_raw_sched_process_template *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -381,8 +377,7 @@ int handle_sched_process_fork(struct trace_event_raw_sched_process_template *ctx
     return 0;
 }
 
-SEC("tracepoint/sched/sched_stat_run")
-int handle_sched_stat_run(struct trace_event_raw_sched_stat_run *ctx)
+static __always_inline int handle_sched_stat_run(struct trace_event_raw_sched_stat_run *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     __u64 cpu_ns = ctx->runtime;
@@ -390,6 +385,9 @@ int handle_sched_stat_run(struct trace_event_raw_sched_stat_run *ctx)
     update_cpu_track(pid, cpu_ns);
     return 0;
 }
+
+BPF_TRACE_sched_process_fork();
+BPF_TRACE_sched_stat_run();
 
 static __always_inline void update_fd_count(__u32 pid, __u8 type, int increment)
 {
@@ -461,51 +459,18 @@ static __always_inline void remove_fd_type(__u32 pid, __u32 fd)
     bpf_map_delete_elem(&fd_type_track, &key);
 }
 
-SEC("tracepoint/syscalls/sys_enter_openat")
-int handle_enter_openat(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_enter_openat(struct trace_event_raw_sys_enter *ctx)
 {
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u32 fd = ctx->ret;
-    if ((int)fd < 0) return 0;
-
-    track_fd_type(pid, fd, FD_TYPE_FILE);
-    update_fd_count(pid, FD_TYPE_FILE, 1);
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_socket")
-int handle_enter_socket(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_enter_socket(struct trace_event_raw_sys_enter *ctx)
 {
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u32 fd = ctx->ret;
-    if ((int)fd < 0) return 0;
-
-    int domain = ctx->args[0];
-    int type = ctx->args[1];
-    int protocol = ctx->args[2];
-
-    (void)domain;
-    (void)type;
-    (void)protocol;
-
-    track_fd_type(pid, fd, FD_TYPE_SOCKET);
-    update_fd_count(pid, FD_TYPE_SOCKET, 1);
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_close")
-int handle_enter_close(struct trace_event_raw_sys_enter *ctx)
-{
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u32 fd = ctx->args[0];
-
-    __u8 type = get_fd_type(pid, fd);
-    if (type != FD_TYPE_UNKNOWN) {
-        update_fd_count(pid, type, 0);
-        remove_fd_type(pid, fd);
-    }
-    return 0;
-}
+BPF_TRACE_sys_enter(openat, handle_enter_openat);
+BPF_TRACE_sys_enter(socket, handle_enter_socket);
 
 /*
  * I/O tracking via syscall tracepoints
@@ -527,7 +492,7 @@ struct {
     __type(value, struct io_track);
 } io_monitor SEC(".maps");
 
-static __always_inline void update_io_track(__u32 pid, __u64 bytes, bool is_read)
+static __always_inline void update_io_track(__u32 pid, __u64 bytes, __u8 is_read)
 {
     struct io_track *track;
     struct io_track zero = {};
@@ -551,37 +516,37 @@ static __always_inline void update_io_track(__u32 pid, __u64 bytes, bool is_read
     }
 }
 
-SEC("tracepoint/syscalls/sys_enter_read")
-int handle_enter_read(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_enter_read(struct trace_event_raw_sys_enter *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u64 count = ctx->args[2];
+    __u64 count = (__u64)PT_REGS_PARM3(ctx);
 
-    update_io_track(pid, count, true);
+    update_io_track(pid, count, 1);
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_write")
-int handle_enter_write(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_enter_write(struct trace_event_raw_sys_enter *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u64 count = ctx->args[2];
+    __u64 count = (__u64)PT_REGS_PARM3(ctx);
 
-    update_io_track(pid, count, false);
+    update_io_track(pid, count, 0);
     return 0;
 }
+
+BPF_TRACE_sys_enter(read, handle_enter_read);
+BPF_TRACE_sys_enter(write, handle_enter_write);
 
 struct iovec {
     void *iov_base;
     __u64 iov_len;
 };
 
-SEC("tracepoint/syscalls/sys_enter_readv")
-int handle_enter_readv(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_enter_readv(struct trace_event_raw_sys_enter *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    struct iovec *iov = (struct iovec *)ctx->args[1];
-    int iovcnt = (int)ctx->args[2];
+    struct iovec *iov = (struct iovec *)PT_REGS_PARM2(ctx);
+    int iovcnt = (int)PT_REGS_PARM3(ctx);
     __u64 total_bytes = 0;
 
     if (iovcnt <= 0 || !iov)
@@ -599,16 +564,15 @@ int handle_enter_readv(struct trace_event_raw_sys_enter *ctx)
         total_bytes += vec.iov_len;
     }
 
-    update_io_track(pid, total_bytes, true);
+    update_io_track(pid, total_bytes, 1);
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_writev")
-int handle_enter_writev(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_enter_writev(struct trace_event_raw_sys_enter *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    struct iovec *iov = (struct iovec *)ctx->args[1];
-    int iovcnt = (int)ctx->args[2];
+    struct iovec *iov = (struct iovec *)PT_REGS_PARM2(ctx);
+    int iovcnt = (int)PT_REGS_PARM3(ctx);
     __u64 total_bytes = 0;
 
     if (iovcnt <= 0 || !iov)
@@ -626,8 +590,11 @@ int handle_enter_writev(struct trace_event_raw_sys_enter *ctx)
         total_bytes += vec.iov_len;
     }
 
-    update_io_track(pid, total_bytes, false);
+    update_io_track(pid, total_bytes, 0);
     return 0;
 }
+
+BPF_TRACE_sys_enter(readv, handle_enter_readv);
+BPF_TRACE_sys_enter(writev, handle_enter_writev);
 
 char LICENSE[] SEC("license") = "GPL";

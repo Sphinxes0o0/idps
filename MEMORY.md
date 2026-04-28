@@ -23,12 +23,20 @@ XDP eBPF (内核态)
 
 ## Build & Run
 ```bash
-# Build in ebpf-test container (has bpftool)
-docker exec ebpf-test bash -c 'cd /idps && rm -rf build && cmake -S . -B build && cmake --build build'
+# Build in Docker container (has all kernel headers)
+docker run --rm -v $(pwd):/idps -w /idps ubuntu:22.04 bash -c \
+  'apt-get update > /dev/null 2>&1 && apt-get install -y cmake clang llvm libbpf-dev pkg-config make git libelf-dev nlohmann-json3-dev > /dev/null 2>&1 && cmake -S . -B build && cmake --build build'
 
-# Run tests (ctest has path issues - run binaries directly)
-docker exec ebpf-test bash -c 'cd /idps/build && ./bin/test_pool && ./bin/test_queue && ./bin/test_rule_parser'
+# Run tests (execute binaries directly - ctest has path issues)
+docker run --rm -v $(pwd):/idps -w /idps ubuntu:22.04 bash -c \
+  'cd /idps/build && ./bin/test_pool && ./bin/test_queue && ./bin/test_rule_parser'
 ```
+
+## External Dependencies
+- **libbpf-bootstrap**: https://github.com/libbpf/libbpf-bootstrap - BPF 应用开发脚手架
+  - 提供 tracepoint 宏 (`BPF_TRACE_sys_enter` 等)
+  - 参考示例: `examples/c/bootstrap.bpf.c` (process 跟踪)
+  - 参考示例: `examples/c/fentry.bpf.c` (fentry/fexit 跟踪)
 
 ## Implemented Features
 - [x] SYN/ICMP Flood Detection

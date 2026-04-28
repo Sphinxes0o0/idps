@@ -738,7 +738,7 @@ static __always_inline int parse_ipv6(void *data, void *data_end,
         __u8 ext_len = (nexthdr == 44) ? 8 : (opt_hdr->hdrlen + 1) * 8;
         hdr = (__u8 *)hdr + ext_len;
 
-        if (hdr >= data_end)
+        if ((void *)hdr >= data_end)
             return -1;
     }
 
@@ -1318,7 +1318,6 @@ static __always_inline int check_dns_amplification(__u32 src_ip, __u32 dst_ip,
             /* 检测放大: 响应 > dns_amp_threshold x 查询 (可配置阈值) */
             __u32 dns_thresh = cfg ? cfg->dns_amp_threshold : 10;
             if (a_stats->query_bytes > 0 &&
-                a_stats->query_bytes <= UINT64_MAX / dns_thresh &&
                 a_stats->response_bytes > a_stats->query_bytes * dns_thresh &&
                 !a_stats->alert_sent) {
                 send_alert(src_ip, dst_ip, src_port, dst_port,

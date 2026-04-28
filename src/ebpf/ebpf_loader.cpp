@@ -138,9 +138,7 @@ bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bp
 
 void EbpfLoader::detach() {
     if (attached_ && ifindex_ > 0) {
-        struct bpf_xdp_attach_opts opts = {};
-        opts.sz = sizeof(opts);
-        bpf_xdp_detach(ifindex_, 0, &opts);
+        bpf_set_link_xdp_fd(ifindex_, -1, 0);
         attached_ = false;
     }
 
@@ -316,14 +314,10 @@ bool EbpfLoader::attach_xdp() {
         return false;
     }
 
-    struct bpf_xdp_attach_opts opts = {};
-    opts.sz = sizeof(opts);
-    opts.old_prog_fd = -1;
-
-    int err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE, &opts);
+    int err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE);
     if (err < 0) {
-        LOG_ERR("ebpf", "bpf_xdp_attach failed, trying SKB mode");
-        err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE, &opts);
+        LOG_ERR("ebpf", "bpf_set_link_xdp_fd failed, trying SKB mode");
+        err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE);
         if (err < 0) {
             LOG_ERR("ebpf", "failed to attach XDP: %s (try running as root)", strerror(errno));
             return false;

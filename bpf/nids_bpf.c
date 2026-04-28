@@ -254,8 +254,10 @@ static __always_inline __u32 match_simple_rules(__u8 proto, __u16 dst_port) {
         if (!port_match(rule->dst_port, rule->dst_port_max, dst_port))
             continue;
 
-        /* 找到匹配！更新索引以加速下次查找 */
-        bpf_map_update_elem(&rule_index, &idx_key, &key, BPF_ANY);
+        /* 找到匹配！仅对单端口规则更新索引（范围规则无法索引） */
+        if (rule->dst_port_max == 0) {
+            bpf_map_update_elem(&rule_index, &idx_key, &key, BPF_ANY);
+        }
 
         /* 返回 rule_id + dpi_needed (bit 31) + action (bit 30) */
         return rule->rule_id | ((__u32)rule->dpi_needed << 31) | ((__u32)rule->action << 30);

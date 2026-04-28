@@ -4,6 +4,7 @@
  */
 
 #include "rule_parser.h"
+#include "../core/logger.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -220,6 +221,9 @@ RuleSet RuleParser::parse_file(const std::string& path) {
         MatchRule rule;
 
         if (parse_line(line, rule)) {
+            if (rule.content.empty()) {
+                LOG_WARN("RULE", "rule %d at line %d has empty content - will match all packets", rule.id, line_num);
+            }
             if (rule.need_dpi) {
                 rs.content_rules.push_back(rule);
             } else {

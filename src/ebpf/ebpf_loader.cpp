@@ -144,8 +144,6 @@ void EbpfLoader::detach() {
         attached_ = false;
     }
 
-    close_maps();
-
     if (obj_) {
         bpf_object__close(obj_);
         obj_ = nullptr;
@@ -238,12 +236,23 @@ bool EbpfLoader::delete_rule(uint32_t rule_id) {
     }
 
     uint32_t key = rule_id;
+
+    RuleEntry rule;
+    if (bpf_map_lookup_elem(rules_fd, &key, &rule) == 0) {
+        int idx_fd = get_map_fd("rule_index");
+        if (idx_fd >= 0) {
+            uint32_t idx_key = ((uint32_t)rule.protocol << 16) | rule.dst_port;
+            bpf_map_delete_elem(idx_fd, &idx_key);
+        }
+    }
+
     int err = bpf_map_delete_elem(rules_fd, &key);
     if (err < 0 && errno != ENOENT) {
         LOG_ERR("ebpf", "failed to delete rule %u: %s", rule_id, strerror(errno));
         return false;
     }
 
+    LOG_DEBUG("ebpf", "deleted rule %u", rule_id);
     return true;
 }
 

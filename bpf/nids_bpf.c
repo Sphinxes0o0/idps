@@ -65,6 +65,7 @@ static __always_inline int check_alert_rate_limit(__u32 src_ip, __u8 event_type)
     struct alert_rate_value *r_val = bpf_map_lookup_elem(&alert_rate_limit, &r_key);
     __u64 now = bpf_ktime_get_ns();
     __u64 min_interval = 1000000000ULL;  /* 1 second minimum between alerts */
+    __u64 window_reset = 10000000000ULL;  /* 10 seconds - reset count after this */
 
     if (!r_val) {
         /* First alert from this source/type */
@@ -73,6 +74,13 @@ static __always_inline int check_alert_rate_limit(__u32 src_ip, __u8 event_type)
             .alert_count = 1,
         };
         bpf_map_update_elem(&alert_rate_limit, &r_key, &new_val, BPF_ANY);
+        return 0;
+    }
+
+    /* Check if window expired - reset count */
+    if (now - r_val->last_alert_time > window_reset) {
+        r_val->last_alert_time = now;
+        r_val->alert_count = 1;
         return 0;
     }
 

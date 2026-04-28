@@ -50,6 +50,7 @@ enum EventType {
     EVENT_FTP_CMD = 10,     /* FTP command detected */
     EVENT_TELNET_OPT = 11,  /* Telnet option negotiation detected */
     EVENT_PORT_SCAN = 12,   /* Port scan detected */
+    EVENT_FRAG_REASSEMBLE = 13, /* Fragment reassembly complete */
 };
 
 /*

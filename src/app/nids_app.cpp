@@ -297,6 +297,16 @@ bool NidsApp::start() {
                     LOG_DEBUG("app", "DPI_REQUEST for rule %u src=%u:%u dst=%u:%u proto=%u",
                               event.rule_id, event.src_ip, event.src_port,
                               event.dst_ip, event.dst_port, event.protocol);
+                } else if (event.event_type == EVENT_FRAG_REASSEMBLE) {
+                    // Fragment reassembly complete - rule_id contains fragment count
+                    sev.type = SecEvent::Type::UNKNOWN;
+                    std::snprintf(sev.message, sizeof(sev.message),
+                                  "Fragment reassembly complete: %u fragments from %08x:%u to %08x:%u",
+                                  event.rule_id, event.src_ip, event.src_port,
+                                  event.dst_ip, event.dst_port);
+                    LOG_DEBUG("app", "FRAG_REASSEMBLE: %u fragments src=%u:%u dst=%u:%u proto=%u",
+                              event.rule_id, event.src_ip, event.src_port,
+                              event.dst_ip, event.dst_port, event.protocol);
                 } else {
                     sev.type = SecEvent::Type::UNKNOWN;
                 }

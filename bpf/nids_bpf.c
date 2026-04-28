@@ -54,6 +54,40 @@ static __always_inline __u32 get_config_drop_enabled(void) {
 }
 
 /*
+ * Rate limiting check for alerts
+ * Returns: 0 = send alert allowed, 1 = rate limited
+ */
+static __always_inline int check_alert_rate_limit(__u32 src_ip, __u8 event_type) {
+    struct alert_rate_key r_key = {
+        .src_ip = src_ip,
+        .event_type = event_type,
+    };
+    struct alert_rate_value *r_val = bpf_map_lookup_elem(&alert_rate_limit, &r_key);
+    __u64 now = bpf_ktime_get_ns();
+    __u64 min_interval = 1000000000ULL;  /* 1 second minimum between alerts */
+
+    if (!r_val) {
+        /* First alert from this source/type */
+        struct alert_rate_value new_val = {
+            .last_alert_time = now,
+            .alert_count = 1,
+        };
+        bpf_map_update_elem(&alert_rate_limit, &r_key, &new_val, BPF_ANY);
+        return 0;
+    }
+
+    /* Check if enough time has passed since last alert */
+    if (now - r_val->last_alert_time < min_interval) {
+        return 1;  /* Rate limited */
+    }
+
+    /* Update rate limit entry */
+    r_val->last_alert_time = now;
+    r_val->alert_count++;
+    return 0;
+}
+
+/*
  * 发送告警事件到 Ringbuf
  * 零拷贝路径
  */
@@ -61,6 +95,13 @@ static __always_inline int send_alert(__u32 src_ip, __u32 dst_ip,
                                        __u16 src_port, __u16 dst_port,
                                        __u8 proto, __u8 severity,
                                        __u32 rule_id, __u8 event_type) {
+    /* Rate limiting for DDoS-type alerts */
+    if (event_type >= EVENT_SYN_FLOOD && event_type <= EVENT_DNS_AMP) {
+        if (check_alert_rate_limit(src_ip, event_type)) {
+            return -1;  /* Rate limited, drop */
+        }
+    }
+
     struct alert_event *event;
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);

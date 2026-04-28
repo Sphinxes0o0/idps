@@ -222,6 +222,25 @@ struct {
     __uint(max_entries, 256 * 1024);  /* 256KB ring buffer */
 } events SEC(".maps");
 
+/* Alert rate limiting - tracks last alert time per source IP for DDoS alerts */
+struct alert_rate_key {
+    __u32 src_ip;
+    __u8 event_type;  /* Which alert type */
+    __u8 padding[3];
+};
+
+struct alert_rate_value {
+    __u64 last_alert_time;
+    __u32 alert_count;  /* Count in current window */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct alert_rate_key);
+    __type(value, struct alert_rate_value);
+} alert_rate_limit SEC(".maps");
+
 /* SYN flood 跟踪表 - LRU Hash (key = syn_flood_key) */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);

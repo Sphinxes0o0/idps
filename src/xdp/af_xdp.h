@@ -139,6 +139,17 @@ public:
     XdpProcessor& operator=(const XdpProcessor&) = delete;
 
     /**
+     * @brief 检查 AF_XDP 是否可用
+     * @return true AF_XDP 可用
+     */
+    static bool is_available();
+
+    /**
+     * @brief 获取 AF_XDP 不可用时的错误信息
+     */
+    static std::string get_unavailable_reason();
+
+    /**
      * @brief 打开 AF_XDP socket
      * @param config 配置
      * @return true 成功

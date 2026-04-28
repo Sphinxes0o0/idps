@@ -136,6 +136,17 @@ public:
      */
     const std::string& get_iface() const { return iface_; }
 
+    /*
+     * @brief 检查 BPF 是否可用
+     * @return true BPF 可用
+     */
+    static bool is_bpf_available();
+
+    /*
+     * @brief 获取 BPF 不可用时的错误信息
+     */
+    static std::string get_bpf_unavailable_reason();
+
 private:
     bool load_bpf_object(const std::string& path);
     bool attach_xdp();

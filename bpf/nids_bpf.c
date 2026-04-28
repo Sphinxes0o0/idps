@@ -488,6 +488,15 @@ static __always_inline int parse_ipv6(void *data, void *data_end,
     return 0;
 }
 
+static __always_inline __u32 compute_frag_buf_id(struct frag_key *fkey) {
+    /* Use ror32 hash for better distribution to reduce collisions */
+    __u32 src = (__u32)((fkey->src_ip << 15) | (fkey->src_ip >> 17));
+    __u32 dst = (__u32)((fkey->dst_ip << 7) | (fkey->dst_ip >> 25));
+    __u32 id = (__u32)(fkey->ip_id * 0x45d9f3b);
+    __u32 proto = (__u32)((fkey->protocol << 16) | (fkey->protocol >> 16));
+    return src ^ dst ^ id ^ proto;
+}
+
 static __always_inline int check_icmp_flood(__u32 src_ip);
 
 /*
@@ -612,7 +621,11 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
             frag_data_len = FRAG_BUFFER_SIZE;
 
         /* Allocate buffer and store fragment */
-        buf_id = (__u32)(fkey.src_ip ^ fkey.dst_ip ^ fkey.ip_id ^ (fkey.protocol << 16));
+        /* Use ror32 for better hash distribution to reduce collisions */
+        buf_id = (__u32)((fkey.src_ip << 15) | (fkey.src_ip >> 17)) ^
+                 (__u32)((fkey.dst_ip << 7) | (fkey.dst_ip >> 25)) ^
+                 (__u32)(fkey.ip_id * 0x45d9f3b) ^
+                 (__u32)((fkey.protocol << 16) | (fkey.protocol >> 16));
         struct frag_data fbuf = {
             .session_id = buf_id,
             .offset = frag_offset * 8,  /* Convert to bytes */
@@ -643,7 +656,7 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
     /* Check for timeout */
     if (now - entry->first_seen > FRAG_TIMEOUT_NS) {
         /* Timeout - delete entry and buffer */
-        buf_id = (__u32)(fkey.src_ip ^ fkey.dst_ip ^ fkey.ip_id ^ (fkey.protocol << 16));
+        buf_id = compute_frag_buf_id(&fkey);
         bpf_map_delete_elem(&frag_track, &fkey);
         bpf_map_delete_elem(&frag_buffers, &buf_id);
         increment_stat(STATS_PACKETS_PASSED, 1);
@@ -660,7 +673,7 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
         entry->complete = 1;
 
         /* Reassembly complete - delete tracking and pass packet */
-        buf_id = (__u32)(fkey.src_ip ^ fkey.dst_ip ^ fkey.ip_id ^ (fkey.protocol << 16));
+        buf_id = compute_frag_buf_id(&fkey);
         bpf_map_delete_elem(&frag_track, &fkey);
         bpf_map_delete_elem(&frag_buffers, &buf_id);
 
@@ -780,7 +793,7 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
             frag_data_len = FRAG_BUFFER_SIZE;
 
         /* Allocate buffer and store fragment */
-        buf_id = fkey.src_ip ^ fkey.dst_ip ^ fkey.ip_id ^ (fkey.protocol << 16);
+        buf_id = compute_frag_buf_id(&fkey);
         struct frag_data fbuf = {
             .session_id = buf_id,
             .offset = frag_offset * 8,  /* Convert to bytes */
@@ -811,7 +824,7 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
     /* Check for timeout */
     if (now - entry->first_seen > FRAG_TIMEOUT_NS) {
         /* Timeout - delete entry and buffer */
-        buf_id = fkey.src_ip ^ fkey.dst_ip ^ fkey.ip_id ^ (fkey.protocol << 16);
+        buf_id = compute_frag_buf_id(&fkey);
         bpf_map_delete_elem(&frag_track, &fkey);
         bpf_map_delete_elem(&frag_buffers, &buf_id);
         increment_stat(STATS_PACKETS_PASSED, 1);
@@ -824,7 +837,7 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
         entry->complete = 1;
 
         /* Reassembly complete - delete tracking and pass packet */
-        buf_id = fkey.src_ip ^ fkey.dst_ip ^ fkey.ip_id ^ (fkey.protocol << 16);
+        buf_id = compute_frag_buf_id(&fkey);
         bpf_map_delete_elem(&frag_track, &fkey);
         bpf_map_delete_elem(&frag_buffers, &buf_id);
 
@@ -888,6 +901,8 @@ static __always_inline int check_dns_amplification(__u32 src_ip, __u32 dst_ip,
                                                    __u16 src_port, __u16 dst_port,
                                                    __u32 pkt_len) {
     __u64 now = bpf_ktime_get_ns();
+    __u32 key = 0;
+    struct config_entry *cfg = bpf_map_lookup_elem(&config, &key);
 
     if (dst_port == 53 && src_port != 53) {
         /* DNS 查询: attacker→DNS server (victim IP is spoofed as src_ip)
@@ -943,9 +958,10 @@ static __always_inline int check_dns_amplification(__u32 src_ip, __u32 dst_ip,
                 a_stats->last_seen = now;
             }
 
-            /* 检测放大: 响应 > 10x 查询 (典型放大倍数) */
+            /* 检测放大: 响应 > dns_amp_threshold x 查询 (可配置阈值) */
+            __u32 dns_thresh = cfg ? cfg->dns_amp_threshold : 10;
             if (a_stats->query_bytes > 0 &&
-                a_stats->response_bytes > a_stats->query_bytes * 10 &&
+                a_stats->response_bytes > a_stats->query_bytes * dns_thresh &&
                 !a_stats->alert_sent) {
                 send_alert(src_ip, dst_ip, src_port, dst_port,
                            IPPROTO_UDP, SEVERITY_HIGH,

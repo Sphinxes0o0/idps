@@ -65,6 +65,31 @@ EbpfLoader::~EbpfLoader() {
     detach();
 }
 
+bool EbpfLoader::is_bpf_available() {
+    int sock = socket(AF_INET, SOCK_RAW, 0);
+    if (sock >= 0) {
+        close(sock);
+        return true;
+    }
+    return false;
+}
+
+std::string EbpfLoader::get_bpf_unavailable_reason() {
+    int sock = socket(AF_INET, SOCK_RAW, 0);
+    if (sock >= 0) {
+        close(sock);
+        return "BPF is available";
+    }
+    
+    if (errno == EAFNOSUPPORT) {
+        return "BPF not supported: CONFIG_BPF not enabled in kernel";
+    } else if (errno == EPERM) {
+        return "BPF not available: permission denied (need root or CAP_BPF)";
+    } else {
+        return "BPF not available: " + std::string(strerror(errno));
+    }
+}
+
 bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bpf_obj_path) {
     if (loaded_) {
         LOG_WARN("ebpf", "already loaded, call detach first");

@@ -156,6 +156,7 @@ struct config_entry {
     __u32 enabled;
     __u32 drop_enabled;  /* 运行时可配置 */
     __u32 port_scan_threshold;
+    __u32 dns_amp_threshold;  /* DNS amplification 检测阈值 (默认 10x) */
 };
 
 /* 统计计数器索引 */

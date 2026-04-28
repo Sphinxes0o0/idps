@@ -57,6 +57,31 @@ XdpProcessor::~XdpProcessor() {
     close();
 }
 
+bool XdpProcessor::is_available() {
+    int sock = socket(AF_XDP, SOCK_RAW, 0);
+    if (sock < 0) {
+        return false;
+    }
+    ::close(sock);
+    return true;
+}
+
+std::string XdpProcessor::get_unavailable_reason() {
+    int sock = socket(AF_XDP, SOCK_RAW, 0);
+    if (sock >= 0) {
+        ::close(sock);
+        return "AF_XDP is available";
+    }
+    
+    if (errno == EAFNOSUPPORT) {
+        return "AF_XDP not supported: kernel or CONFIG_XDP_SOCKETS not enabled";
+    } else if (errno == ENOMEM) {
+        return "AF_XDP not available: insufficient memory";
+    } else {
+        return "AF_XDP not available: " + std::string(strerror(errno));
+    }
+}
+
 bool XdpProcessor::open(const XdpConfig& config) {
     if (opened_) {
         LOG_WARN("xdp", "already opened");

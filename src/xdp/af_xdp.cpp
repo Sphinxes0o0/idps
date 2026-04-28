@@ -670,9 +670,14 @@ void XdpProcessor::detect_tls(const XdpPacket& pkt, const uint8_t* payload, size
 
     /* Check SNI against blocklist rules */
     if (!tls.sni.empty()) {
+        std::string sni_lower = tls.sni;
+        std::transform(sni_lower.begin(), sni_lower.end(), sni_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
         for (const auto& rule : sni_rules_) {
-            /* Simple substring match for SNI pattern */
-            if (tls.sni.find(rule.pattern) != std::string::npos) {
+            std::string pattern_lower = rule.pattern;
+            std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (sni_lower.find(pattern_lower) != std::string::npos) {
                 DpiResult result;
                 result.matched = true;
                 result.rule_id = rule.rule_id;

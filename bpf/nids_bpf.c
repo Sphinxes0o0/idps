@@ -409,9 +409,8 @@ static __always_inline void normalize_flow_key(struct flow_key *key) {
  */
 static __always_inline int check_syn_flood(__u32 src_ip, __u32 dst_ip,
                                           __u16 dst_port, __u8 tcp_flags) {
-    /* 只检测 SYN flood (SYN=2, ACK=16) */
-    if (!(tcp_flags & 0x02) || (tcp_flags & 0x17)) {
-        /* 不是纯 SYN 包，忽略 */
+    /* 只检测纯 SYN flood - SYN flag must be set, no other flags (except ECN) */
+    if (!(tcp_flags & 0x02)) {
         return 0;
     }
 
@@ -1236,10 +1235,17 @@ static __always_inline int check_ssh(const __u8 *payload, __u32 payload_len) {
  */
 static __always_inline int check_ftp(const __u8 *payload, __u32 payload_len) {
     if (payload_len < 4) return 0;
-    /* Check if first 3 bytes are uppercase ASCII letters */
-    if (payload[0] >= 'A' && payload[0] <= 'Z' &&
-        payload[1] >= 'A' && payload[1] <= 'Z' &&
-        payload[2] >= 'A' && payload[2] <= 'Z') return 1;
+    /* Check if first 3 bytes are ASCII letters (case-insensitive, per RFC 959) */
+    __u8 b0 = payload[0];
+    __u8 b1 = payload[1];
+    __u8 b2 = payload[2];
+    /* Convert lowercase to uppercase for case-insensitive matching */
+    if (b0 >= 'a' && b0 <= 'z') b0 = b0 - 'a' + 'A';
+    if (b1 >= 'a' && b1 <= 'z') b1 = b1 - 'a' + 'A';
+    if (b2 >= 'a' && b2 <= 'z') b2 = b2 - 'a' + 'A';
+    if (b0 >= 'A' && b0 <= 'Z' &&
+        b1 >= 'A' && b1 <= 'Z' &&
+        b2 >= 'A' && b2 <= 'Z') return 1;
     return 0;
 }
 
@@ -1317,8 +1323,15 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                 }
 
                 /* ICMPv6 flood detection (protocol 58 = IPPROTO_ICMPV6) */
-                if (ipv6_protocol == IPPROTO_ICMPV6) {
-                    check_icmp_flood(ipv6_src_ip);
+                /* Only type 128 (Echo Request) and 129 (Echo Reply) should trigger flood detection */
+                if (ipv6_protocol == IPPROTO_ICMPV6 && ipv6_transport_hdr != NULL) {
+                    __u8 *icmp6_hdr = (__u8 *)ipv6_transport_hdr;
+                    if ((void *)(icmp6_hdr + 1) <= data_end) {
+                        __u8 icmp6_type = icmp6_hdr[0];
+                        if (icmp6_type == 128 || icmp6_type == 129) {
+                            check_icmp_flood(ipv6_src_ip);
+                        }
+                    }
                 }
 
                 /* DNS Amplification detection */

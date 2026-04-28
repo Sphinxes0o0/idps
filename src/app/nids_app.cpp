@@ -153,6 +153,22 @@ bool NidsApp::reload_rules() {
         if (!loader)
             continue;
 
+        // Collect new rule IDs
+        std::set<uint32_t> new_rule_ids;
+        for (const auto& rule : rs.content_rules) {
+            new_rule_ids.insert(rule.id);
+        }
+        for (const auto& rule : rs.simple_rules) {
+            new_rule_ids.insert(rule.id);
+        }
+
+        // Delete removed rules
+        for (uint32_t old_id : inst.active_rule_ids) {
+            if (new_rule_ids.find(old_id) == new_rule_ids.end()) {
+                loader->delete_rule(old_id);
+            }
+        }
+
         // Push content rules
         for (const auto& rule : rs.content_rules) {
             RuleEntry entry;
@@ -187,6 +203,9 @@ bool NidsApp::reload_rules() {
 
         // Update content rules for user-space BMH
         inst.content_rules = std::move(rs.content_rules);
+
+        // Update active rule IDs for next reload
+        inst.active_rule_ids = std::move(new_rule_ids);
 
         // Update AF_XDP rules if running
         if (inst.xdp) {

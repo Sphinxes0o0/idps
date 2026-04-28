@@ -6,6 +6,7 @@
 #include "../xdp/af_xdp.h"
 #include "../metrics/prometheus_server.h"
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,7 @@ struct PipelineInstance {
     std::unique_ptr<INic>    nic;
     std::unique_ptr<XdpProcessor> xdp;  ///< AF_XDP processor for user-space DPI
     std::vector<MatchRule>   content_rules;  ///< Rules needing BMH content matching
+    std::set<uint32_t>       active_rule_ids;  ///< Track all active rule IDs for hot reload
 };
 
 /**

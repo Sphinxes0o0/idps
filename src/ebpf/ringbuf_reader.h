@@ -51,6 +51,9 @@ enum EventType {
     EVENT_TELNET_OPT = 11,  /* Telnet option negotiation detected */
     EVENT_PORT_SCAN = 12,   /* Port scan detected */
     EVENT_FRAG_REASSEMBLE = 13, /* Fragment reassembly complete */
+    EVENT_ACK_FLOOD = 14,   /* TCP ACK flood detected */
+    EVENT_FIN_FLOOD = 15,   /* TCP FIN flood detected */
+    EVENT_RST_FLOOD = 16,   /* TCP RST flood detected */
 };
 
 /*

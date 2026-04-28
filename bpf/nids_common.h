@@ -41,6 +41,11 @@ enum event_type {
     EVENT_TELNET_OPT = 11,
     EVENT_PORT_SCAN = 12,
     EVENT_FRAG_REASSEMBLE = 13,  /* Fragment reassembly complete, user-space should reassemble */
+    EVENT_ACK_FLOOD = 14,        /* TCP ACK flood detected */
+    EVENT_FIN_FLOOD = 15,       /* TCP FIN flood detected */
+    EVENT_RST_FLOOD = 16,       /* TCP RST flood detected */
+    EVENT_PROCESS_CONNECT = 17,  /* Process connect() syscall */
+    EVENT_PROCESS_CLOSE = 18,    /* Process close() syscall */
 };
 
 /* 告警严重级别 */
@@ -176,6 +181,9 @@ enum stats_index {
     STATS_FTP_CMD = 11,
     STATS_TELNET_OPT = 12,
     STATS_PORT_SCAN_ALERTS = 13,
+    STATS_ACK_FLOOD_ALERTS = 14,
+    STATS_FIN_FLOOD_ALERTS = 15,
+    STATS_RST_FLOOD_ALERTS = 16,
     STATS_MAX = 256,
 };
 
@@ -308,6 +316,32 @@ struct {
     __type(value, struct port_scan_stats);
 } port_scan_track SEC(".maps");
 
+/* TCP ACK flood tracking table - LRU Hash (key = flow_key) */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);
+    __type(value, struct src_track);
+} tcp_ack_flood_track SEC(".maps");
+
+/* TCP FIN flood tracking table - LRU Hash (key = flow_key) */
+/* Tracks FIN packets per source IP to detect single-source FIN flood */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);
+    __type(value, struct src_track);
+} tcp_fin_flood_track SEC(".maps");
+
+/* TCP RST flood tracking table - LRU Hash (key = flow_key) */
+/* Tracks RST packets per source IP to detect single-source RST flood */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);
+    __type(value, struct src_track);
+} tcp_rst_flood_track SEC(".maps");
+
 /* 规则索引 key: (protocol << 16) | dst_port */
 struct rule_index_key {
     __u32 proto_port;  /* (protocol << 16) | port */
@@ -395,6 +429,26 @@ struct frag_data {
     /* Data size is limited by FRAG_BUFFER_SIZE */
 };
 
+/*
+ * process_event - Process lifecycle event (connect/close)
+ * Sent via ringbuf for tracking process network activity
+ */
+struct process_event {
+    __u64 timestamp;
+    __u32 pid;            /* Process ID */
+    __u32 tid;            /* Thread ID */
+    __u32 uid;            /* User ID */
+    __u32 fd;             /* File descriptor (socket fd for connect, closed fd for close) */
+    __u8  event_type;     /* EVENT_PROCESS_CONNECT or EVENT_PROCESS_CLOSE */
+    __u8  addr_family;    /* AF_INET or AF_INET6 */
+    __u8  protocol;       /* IPPROTO_TCP, IPPROTO_UDP, or 0 for close */
+    __u8  padding;
+    __u32 src_ip;         /* Source IP (network byte order for IPv4, first 32 bits for IPv6) */
+    __u32 dst_ip;         /* Destination IP */
+    __u16 src_port;       /* Source port */
+    __u16 dst_port;       /* Destination port */
+};
+
 /* Fragment tracking map - LRU hash to auto-evict old fragments */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -416,5 +470,43 @@ struct {
 #define FRAG_MAX_SIZE 65535               /* Max reassembled packet size */
 #define FRAG_MIN_SIZE 8                   /* Minimum fragment size (8-byte aligned) */
 #define FRAG_BUFFER_SIZE 128              /* Size of each fragment buffer entry */
+
+/* FD tracking */
+#define FD_TYPE_UNKNOWN 0
+#define FD_TYPE_FILE    1
+#define FD_TYPE_SOCKET  2
+#define FD_TYPE_PIPE    3
+
+struct fd_track {
+    __u32 total_fds;
+    __u32 socket_count;
+    __u32 file_count;
+    __u32 pipe_count;
+    __u64 timestamp;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);
+    __type(value, struct fd_track);
+} fd_monitor SEC(".maps");
+
+struct fd_type_key {
+    __u32 pid;
+    __u32 fd;
+};
+
+struct fd_type_val {
+    __u8 type;
+    __u8 padding[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 100000);
+    __type(key, struct fd_type_key);
+    __type(value, struct fd_type_val);
+} fd_type_track SEC(".maps");
 
 #endif /* NIDS_COMMON_H */

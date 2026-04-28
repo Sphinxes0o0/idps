@@ -4,8 +4,17 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <sys/types.h>
 
 namespace nids {
+
+enum class FloodType { ACK, FIN, RST };
+
+struct ProcessMetrics {
+    uint64_t cpu_ns;
+    uint64_t mem_bytes;
+    uint32_t fd_count;
+};
 
 /**
  * @brief Simple metrics registry for Prometheus.
@@ -38,6 +47,10 @@ public:
     void inc_rule_matches();
     void inc_dpi_requests();
 
+    // TCP flood metrics
+    void recordFloodAlert(FloodType type);
+    void updateProcessMetrics(pid_t pid, const ProcessMetrics& m);
+
 private:
     MetricsRegistry() = default;
 
@@ -52,6 +65,18 @@ private:
     std::atomic<uint64_t> ddos_alerts_{0};
     std::atomic<uint64_t> rule_matches_{0};
     std::atomic<uint64_t> dpi_requests_{0};
+
+    std::atomic<int64_t> tcp_ack_flood_active_{0};
+    std::atomic<int64_t> tcp_fin_flood_active_{0};
+    std::atomic<int64_t> tcp_rst_flood_active_{0};
+    std::atomic<uint64_t> tcp_ack_flood_total_{0};
+    std::atomic<uint64_t> tcp_fin_flood_total_{0};
+    std::atomic<uint64_t> tcp_rst_flood_total_{0};
+
+    std::atomic<int64_t> process_count_{0};
+    std::atomic<uint64_t> process_cpu_ns_{0};
+    std::atomic<uint64_t> process_mem_bytes_{0};
+    std::atomic<int64_t> process_fd_count_{0};
 };
 
 } // namespace nids

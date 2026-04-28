@@ -5,6 +5,7 @@
 #include "../rules/rule_parser.h"
 #include "../xdp/af_xdp.h"
 #include "../metrics/prometheus_server.h"
+#include "../ebpf/trace_reader.h"
 #include <memory>
 #include <set>
 #include <string>
@@ -38,6 +39,7 @@ struct AppConfig {
     std::string event_log = "-";  ///< "-" = stdout
     bool use_syslog = false;      ///< Also emit events to syslog
     uint16_t metrics_port = 0;   ///< Prometheus metrics port (0 = disabled)
+    std::string trace_bpf_obj;   ///< Path to trace BPF object file
 };
 
 /**
@@ -91,16 +93,14 @@ protected:
     virtual std::unique_ptr<INic> make_nic(const std::string& iface);
 
 private:
-    /**
-     * @brief Load rules from file and push to kernel/user-space
-     */
-    bool load_rules(const std::string& path, INic* nic, std::vector<MatchRule>& content_rules);
-
     AppConfig cfg_;
     std::shared_ptr<EventQueue>      event_queue_;
     std::unique_ptr<CommThread>     comm_thread_;
     std::unique_ptr<PrometheusServer> prom_server_;
     std::vector<PipelineInstance>    instances_;
+    std::unique_ptr<TraceReader>    trace_reader_;
+
+    bool load_rules(const std::string& path, INic* nic, std::vector<MatchRule>& content_rules);
 };
 
 } // namespace nids

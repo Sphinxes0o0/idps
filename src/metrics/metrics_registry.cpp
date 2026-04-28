@@ -60,6 +60,46 @@ std::string MetricsRegistry::collect() const {
     oss << "# TYPE idps_dpi_requests_total counter\n";
     oss << "idps_dpi_requests_total " << dpi_requests_.load(std::memory_order_relaxed) << "\n";
 
+    oss << "# HELP idps_tcp_ack_flood_total Total ACK flood alerts\n";
+    oss << "# TYPE idps_tcp_ack_flood_total counter\n";
+    oss << "idps_tcp_ack_flood_total " << tcp_ack_flood_total_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_tcp_fin_flood_total Total FIN flood alerts\n";
+    oss << "# TYPE idps_tcp_fin_flood_total counter\n";
+    oss << "idps_tcp_fin_flood_total " << tcp_fin_flood_total_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_tcp_rst_flood_total Total RST flood alerts\n";
+    oss << "# TYPE idps_tcp_rst_flood_total counter\n";
+    oss << "idps_tcp_rst_flood_total " << tcp_rst_flood_total_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_tcp_ack_flood_active ACK flood detection active flows\n";
+    oss << "# TYPE idps_tcp_ack_flood_active gauge\n";
+    oss << "idps_tcp_ack_flood_active " << tcp_ack_flood_active_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_tcp_fin_flood_active FIN flood detection active flows\n";
+    oss << "# TYPE idps_tcp_fin_flood_active gauge\n";
+    oss << "idps_tcp_fin_flood_active " << tcp_fin_flood_active_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_tcp_rst_flood_active RST flood detection active flows\n";
+    oss << "# TYPE idps_tcp_rst_flood_active gauge\n";
+    oss << "idps_tcp_rst_flood_active " << tcp_rst_flood_active_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_process_count Number of tracked processes\n";
+    oss << "# TYPE idps_process_count gauge\n";
+    oss << "idps_process_count " << process_count_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_process_cpu_ns Process CPU time in nanoseconds\n";
+    oss << "# TYPE idps_process_cpu_ns gauge\n";
+    oss << "idps_process_cpu_ns " << process_cpu_ns_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_process_mem_bytes Process memory usage bytes\n";
+    oss << "# TYPE idps_process_mem_bytes gauge\n";
+    oss << "idps_process_mem_bytes " << process_mem_bytes_.load(std::memory_order_relaxed) << "\n";
+
+    oss << "# HELP idps_process_fd_count Process FD count\n";
+    oss << "# TYPE idps_process_fd_count gauge\n";
+    oss << "idps_process_fd_count " << process_fd_count_.load(std::memory_order_relaxed) << "\n";
+
     // Custom counters
     for (const auto& info : counter_infos_) {
         auto it = counter_values_.find(info.name);
@@ -103,6 +143,31 @@ void MetricsRegistry::inc_rule_matches() {
 
 void MetricsRegistry::inc_dpi_requests() {
     dpi_requests_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::recordFloodAlert(FloodType type) {
+    switch (type) {
+        case FloodType::ACK:
+            tcp_ack_flood_total_.fetch_add(1, std::memory_order_relaxed);
+            tcp_ack_flood_active_.store(1, std::memory_order_relaxed);
+            break;
+        case FloodType::FIN:
+            tcp_fin_flood_total_.fetch_add(1, std::memory_order_relaxed);
+            tcp_fin_flood_active_.store(1, std::memory_order_relaxed);
+            break;
+        case FloodType::RST:
+            tcp_rst_flood_total_.fetch_add(1, std::memory_order_relaxed);
+            tcp_rst_flood_active_.store(1, std::memory_order_relaxed);
+            break;
+    }
+}
+
+void MetricsRegistry::updateProcessMetrics(pid_t pid, const ProcessMetrics& m) {
+    (void)pid;
+    process_count_.store(1, std::memory_order_relaxed);
+    process_cpu_ns_.store(static_cast<int64_t>(m.cpu_ns), std::memory_order_relaxed);
+    process_mem_bytes_.store(static_cast<int64_t>(m.mem_bytes), std::memory_order_relaxed);
+    process_fd_count_.store(static_cast<int64_t>(m.fd_count), std::memory_order_relaxed);
 }
 
 } // namespace nids

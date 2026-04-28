@@ -5,6 +5,7 @@ add_library(nids_core
     nic/ebpf_nic.cpp
     ebpf/ebpf_loader.cpp
     ebpf/ringbuf_reader.cpp
+    ebpf/trace_reader.cpp
     threads/comm_thread.cpp
     rules/rule_parser.cpp
     app/nids_app.cpp

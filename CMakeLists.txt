@@ -95,19 +95,51 @@ add_custom_command(
     VERBATIM
 )
 
+# Custom command to compile tracepoint BPF program
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/bpf/nids_trace.o
+    COMMAND ${CLANG_EXECUTABLE}
+        -target bpf
+        -g
+        -O2
+        -Wall
+        -I${CMAKE_SOURCE_DIR}/bpf
+        -I${LIBBPF_INCLUDE_DIR}
+        -I/usr/include/bpf
+        -I/usr/include
+        -I/usr/include/aarch64-linux-gnu
+        -D__TARGET_ARCH_${BPF_ARCH}
+        -D__BPF_TRACING___
+        -c ${CMAKE_SOURCE_DIR}/bpf/nids_trace.c
+        -o ${CMAKE_BINARY_DIR}/bpf/nids_trace.o
+    DEPENDS
+        ${CMAKE_SOURCE_DIR}/bpf/nids_trace.c
+        ${CMAKE_SOURCE_DIR}/bpf/nids_common.h
+    COMMENT "Compiling eBPF tracepoint program with clang"
+    VERBATIM
+)
+
 # Custom target for BPF (build with: make bpf)
 add_custom_target(bpf ALL
-    DEPENDS ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o
+    DEPENDS ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o ${CMAKE_BINARY_DIR}/bpf/nids_trace.o
     COMMENT "Building eBPF objects"
 )
 
-# Copy BPF object to known location for runtime loading
+# Copy BPF objects to known location for runtime loading
 add_custom_command(
     TARGET bpf POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
         ${CMAKE_BINARY_DIR}/bpf/nids_bpf.o
         ${CMAKE_BINARY_DIR}/bin/nids_bpf.o
     COMMENT "Copying BPF object to bin directory"
+)
+
+add_custom_command(
+    TARGET bpf POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_BINARY_DIR}/bpf/nids_trace.o
+        ${CMAKE_BINARY_DIR}/bin/nids_trace.o
+    COMMENT "Copying trace BPF object to bin directory"
 )
 
 # Generate BPF skeleton header using bpftool
@@ -121,12 +153,21 @@ add_custom_command(
 
 # Custom target for skeleton generation
 add_custom_target(skeleton ALL
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/ebpf/nids_bpf.skel.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/ebpf/nids_bpf.skel.h ${CMAKE_SOURCE_DIR}/src/ebpf/nids_trace.skel.h
     COMMENT "Generating BPF skeleton"
 )
 
 # Ensure skeleton is regenerated when BPF object changes
 add_dependencies(skeleton bpf)
+
+# Generate BPF trace skeleton header using bpftool
+add_custom_command(
+    OUTPUT ${CMAKE_SOURCE_DIR}/src/ebpf/nids_trace.skel.h
+    COMMAND bpftool gen skeleton ${CMAKE_BINARY_DIR}/bpf/nids_trace.o > ${CMAKE_SOURCE_DIR}/src/ebpf/nids_trace.skel.h
+    DEPENDS ${CMAKE_BINARY_DIR}/bpf/nids_trace.o
+    COMMENT "Generating BPF trace skeleton header"
+    VERBATIM
+)
 
 # Source modules --------------------------------------------------------------
 

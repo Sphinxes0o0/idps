@@ -104,7 +104,7 @@ static __always_inline int send_alert(__u32 src_ip, __u32 dst_ip,
                                        __u8 proto, __u8 severity,
                                        __u32 rule_id, __u8 event_type) {
     /* Rate limiting for DDoS-type alerts */
-    if (event_type >= EVENT_SYN_FLOOD && event_type <= EVENT_DNS_AMP) {
+    if (event_type >= EVENT_SYN_FLOOD && event_type <= EVENT_RST_FLOOD) {
         if (check_alert_rate_limit(src_ip, event_type)) {
             return -1;  /* Rate limited, drop */
         }
@@ -403,6 +403,80 @@ static __always_inline void normalize_flow_key(struct flow_key *key) {
 }
 
 /*
+ * TCP RST flood 检测
+ * 检查 TCP RST-only 包 (flags == 0x04, no SYN/FIN/ACK/PSH)
+ * 跟踪每个 flow 的 RST 包速率
+ * 返回: 0=正常, 1=flood detected
+ */
+static __always_inline int check_rst_flood(__u32 src_ip, __u32 dst_ip,
+                                          __u16 src_port, __u16 dst_port,
+                                          __u8 tcp_flags) {
+    /* 只检测纯 RST 包 - flags == 0x04 (RST only, no SYN/FIN/ACK/PSH/URG) */
+    if (tcp_flags != 0x04) {
+        return 0;
+    }
+
+    struct flow_key r_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .protocol = IPPROTO_TCP,
+    };
+    normalize_flow_key(&r_key);
+
+    struct src_track *track = bpf_map_lookup_elem(&tcp_rst_flood_track, &r_key);
+    __u64 now = bpf_ktime_get_ns();
+
+    if (!track) {
+        /* 新条目 */
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&tcp_rst_flood_track, &r_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* Check for timeout - delete stale entry */
+    if (now - track->last_seen > WINDOW_SIZE_NS * 2) {
+        bpf_map_delete_elem(&tcp_rst_flood_track, &r_key);
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&tcp_rst_flood_track, &r_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* 更新统计 */
+    if (now - track->window_start >= WINDOW_SIZE_NS) {
+        /* 重置窗口 */
+        track->window_start = now;
+        track->packet_count = 1;
+    } else {
+        track->packet_count++;
+    }
+    track->last_seen = now;
+
+    /* 检测阈值 */
+    if (track->packet_count >= ddos_threshold) {
+        /* 发送 RST flood 告警 */
+        send_alert(src_ip, dst_ip, src_port, dst_port,
+                   IPPROTO_TCP, SEVERITY_HIGH,
+                   0, EVENT_RST_FLOOD);
+        increment_stat(STATS_RST_FLOOD_ALERTS, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
  * SYN flood 检测
  * 检查 TCP SYN 包，如果源 IP 发送大量 SYN 但无响应则判定为 flood
  * 返回: 0=正常, 1=flood detected
@@ -471,10 +545,153 @@ static __always_inline int check_syn_flood(__u32 src_ip, __u32 dst_ip,
 }
 
 /*
- * ICMP flood 检测
- * 检查 ICMP 包，如果源 IP 发送大量 ICMP 则判定为 flood
+ * TCP ACK Flood 检测
+ * 检查 TCP ACK-only 包 (flags == 0x10, no SYN/FIN/RST/PSH)
+ * 跟踪每个 flow 的 ACK 包速率
  * 返回: 0=正常, 1=flood detected
  */
+static __always_inline int check_ack_flood(__u32 src_ip, __u32 dst_ip,
+                                          __u16 src_port, __u16 dst_port,
+                                          __u8 tcp_flags) {
+    /* 只检测纯 ACK 包 - flags == 0x10 (ACK only, no SYN/FIN/RST/PSH/URG) */
+    if (tcp_flags != 0x10) {
+        return 0;
+    }
+
+    struct flow_key a_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .protocol = IPPROTO_TCP,
+    };
+    normalize_flow_key(&a_key);
+
+    struct src_track *track = bpf_map_lookup_elem(&tcp_ack_flood_track, &a_key);
+    __u64 now = bpf_ktime_get_ns();
+
+    if (!track) {
+        /* 新条目 */
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&tcp_ack_flood_track, &a_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* Check for timeout - delete stale entry */
+    if (now - track->last_seen > WINDOW_SIZE_NS * 2) {
+        bpf_map_delete_elem(&tcp_ack_flood_track, &a_key);
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&tcp_ack_flood_track, &a_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* 更新统计 */
+    if (now - track->window_start >= WINDOW_SIZE_NS) {
+        /* 重置窗口 */
+        track->window_start = now;
+        track->packet_count = 1;
+    } else {
+        track->packet_count++;
+    }
+    track->last_seen = now;
+
+    /* 检测阈值 */
+    if (track->packet_count >= ddos_threshold) {
+        /* 发送 ACK flood 告警 */
+        send_alert(src_ip, dst_ip, src_port, dst_port,
+                   IPPROTO_TCP, SEVERITY_HIGH,
+                   0, EVENT_ACK_FLOOD);
+        increment_stat(STATS_ACK_FLOOD_ALERTS, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * TCP FIN flood 检测
+ * 检查 TCP FIN-only 包 (flags == 0x01, no SYN/ACK/RST/PSH)
+ * 跟踪每个 flow 的 FIN 包速率
+ * 返回: 0=正常, 1=flood detected
+ */
+static __always_inline int check_fin_flood(__u32 src_ip, __u32 dst_ip,
+                                          __u16 src_port, __u16 dst_port,
+                                          __u8 tcp_flags) {
+    /* 只检测纯 FIN 包 - flags == 0x01 (FIN only, no SYN/ACK/RST/PSH/URG) */
+    if (tcp_flags != 0x01) {
+        return 0;
+    }
+
+    struct flow_key f_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .protocol = IPPROTO_TCP,
+    };
+    normalize_flow_key(&f_key);
+
+    struct src_track *track = bpf_map_lookup_elem(&tcp_fin_flood_track, &f_key);
+    __u64 now = bpf_ktime_get_ns();
+
+    if (!track) {
+        /* 新条目 */
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&tcp_fin_flood_track, &f_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* Check for timeout - delete stale entry */
+    if (now - track->last_seen > WINDOW_SIZE_NS * 2) {
+        bpf_map_delete_elem(&tcp_fin_flood_track, &f_key);
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&tcp_fin_flood_track, &f_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
+    /* 更新统计 */
+    if (now - track->window_start >= WINDOW_SIZE_NS) {
+        /* 重置窗口 */
+        track->window_start = now;
+        track->packet_count = 1;
+    } else {
+        track->packet_count++;
+    }
+    track->last_seen = now;
+
+    /* 检测阈值 */
+    if (track->packet_count >= ddos_threshold) {
+        /* 发送 FIN flood 告警 */
+        send_alert(src_ip, dst_ip, src_port, dst_port,
+                   IPPROTO_TCP, SEVERITY_HIGH,
+                   0, EVENT_FIN_FLOOD);
+        increment_stat(STATS_FIN_FLOOD_ALERTS, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
 /*
  * Parse IPv6 packet and extract 5-tuple with transport layer header
  * Handles extension headers by skipping them to find the actual transport protocol
@@ -1317,6 +1534,21 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                     check_syn_flood(ipv6_src_ip, ipv6_dst_ip, ipv6_dst_port, ipv6_tcp_flags);
                 }
 
+                /* TCP ACK flood detection */
+                if (ipv6_protocol == IPPROTO_TCP) {
+                    check_ack_flood(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port, ipv6_tcp_flags);
+                }
+
+                /* TCP FIN flood detection */
+                if (ipv6_protocol == IPPROTO_TCP) {
+                    check_fin_flood(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port, ipv6_tcp_flags);
+                }
+
+                /* TCP RST flood detection */
+                if (ipv6_protocol == IPPROTO_TCP) {
+                    check_rst_flood(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port, ipv6_tcp_flags);
+                }
+
                 /* Port scan detection */
                 if (ipv6_protocol == IPPROTO_TCP) {
                     check_port_scan(ipv6_src_ip, ipv6_dst_ip, ipv6_dst_port, ipv6_tcp_flags);
@@ -1445,6 +1677,21 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     /* SYN flood 检测 (TCP with only SYN flag) */
     if (key.protocol == IPPROTO_TCP) {
         check_syn_flood(key.src_ip, key.dst_ip, key.dst_port, tcp_flags);
+    }
+
+    /* TCP ACK flood 检测 (ACK-only packets) */
+    if (key.protocol == IPPROTO_TCP) {
+        check_ack_flood(key.src_ip, key.dst_ip, key.src_port, key.dst_port, tcp_flags);
+    }
+
+    /* TCP FIN flood 检测 (FIN-only packets) */
+    if (key.protocol == IPPROTO_TCP) {
+        check_fin_flood(key.src_ip, key.dst_ip, key.src_port, key.dst_port, tcp_flags);
+    }
+
+    /* TCP RST flood 检测 (RST-only packets) */
+    if (key.protocol == IPPROTO_TCP) {
+        check_rst_flood(key.src_ip, key.dst_ip, key.src_port, key.dst_port, tcp_flags);
     }
 
     /* Port scan detection (TCP with SYN, FIN, NULL, or XMAS flags) */

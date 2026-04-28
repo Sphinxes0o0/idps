@@ -848,13 +848,13 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
 
     /* This is a fragment - look up tracking entry */
     __builtin_memset(&fkey, 0, sizeof(fkey));
-    /* For IPv6, we use the first 32 bits of src/dst IP */
+    /* For IPv6, fold 128-bit address into 32-bit using ror32-based hash */
     __u32 *src_ip_arr = (__u32 *)ipv6->saddr.in6_u.u6_addr32;
     __u32 *dst_ip_arr = (__u32 *)ipv6->daddr.in6_u.u6_addr32;
-    fkey.src_ip = src_ip_arr[0] ^ src_ip_arr[1] ^ src_ip_arr[2] ^ src_ip_arr[3];
-    fkey.dst_ip = dst_ip_arr[0] ^ dst_ip_arr[1] ^ dst_ip_arr[2] ^ dst_ip_arr[3];
+    fkey.src_ip = src_ip_arr[0] ^ (src_ip_arr[1] << 12) ^ (src_ip_arr[2] >> 12) ^ (src_ip_arr[3] << 6);
+    fkey.dst_ip = dst_ip_arr[0] ^ (dst_ip_arr[1] << 12) ^ (dst_ip_arr[2] >> 12) ^ (dst_ip_arr[3] << 6);
     fkey.ip_id = ip_id;
-    fkey.protocol = ipv6->nexthdr;  /* Next header after fragment header */
+    fkey.protocol = frag->nexthdr;  /* Actual transport protocol from fragment header */
     fkey.ip_version = 6;
 
     entry = bpf_map_lookup_elem(&frag_track, &fkey);
@@ -899,7 +899,7 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
             .dst_ip = dst_ip_arr[0],
             .src_port = 0,
             .dst_port = 0,
-            .protocol = ipv6->nexthdr,
+            .protocol = frag->nexthdr,  /* Actual transport protocol from fragment header */
         };
         new_entry.frags[0].buf_id = buf_id;
         new_entry.frags[0].offset = (__u16)(frag_offset * 8);

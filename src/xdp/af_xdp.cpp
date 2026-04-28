@@ -385,6 +385,15 @@ void XdpProcessor::process_packets() {
         completion_ring_[idx].options = 0;
         (*cprod)++;
     }
+
+    // Return any remaining frames that weren't processed (partial recvmmsg)
+    for (int i = n; i < frame_count; i++) {
+        uint32_t idx = (*cprod) & (num_frames_ - 1);
+        completion_ring_[idx].addr = reinterpret_cast<uint64_t>(frames[i]);
+        completion_ring_[idx].len = frame_size_;
+        completion_ring_[idx].options = 0;
+        (*cprod)++;
+    }
 }
 
 bool XdpProcessor::parse_packet(uint8_t* data, uint32_t len, XdpPacket& pkt) {

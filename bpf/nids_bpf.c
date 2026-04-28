@@ -384,6 +384,19 @@ static __always_inline int check_syn_flood(__u32 src_ip, __u32 dst_ip,
         return 0;
     }
 
+    /* Check for timeout - delete stale entry */
+    if (now - track->last_seen > WINDOW_SIZE_NS * 2) {
+        bpf_map_delete_elem(&syn_flood_track, &s_key);
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&syn_flood_track, &s_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
     /* 更新统计 */
     if (now - track->window_start >= WINDOW_SIZE_NS) {
         /* 重置窗口 */
@@ -933,6 +946,19 @@ static __always_inline int check_icmp_flood(__u32 src_ip) {
         return 0;
     }
 
+    /* Check for timeout - delete stale entry */
+    if (now - track->last_seen > WINDOW_SIZE_NS * 2) {
+        bpf_map_delete_elem(&icmp_flood_track, &i_key);
+        struct src_track new_track = {
+            .packet_count = 1,
+            .last_seen = now,
+            .window_start = now,
+            .flags = 0,
+        };
+        bpf_map_update_elem(&icmp_flood_track, &i_key, &new_track, BPF_ANY);
+        return 0;
+    }
+
     /* 更新统计 */
     if (now - track->window_start >= WINDOW_SIZE_NS) {
         /* 重置窗口 */
@@ -1082,6 +1108,20 @@ static __always_inline int check_port_scan(__u32 src_ip, __u32 dst_ip,
 
     if (!ps_stats) {
         /* New entry */
+        struct port_scan_stats new_ps = {
+            .window_start = now,
+            .last_seen = now,
+            .packet_count = 1,
+            .scan_type_mask = scan_type,
+            .alert_sent = 0,
+        };
+        bpf_map_update_elem(&port_scan_track, &ps_key, &new_ps, BPF_ANY);
+        return 0;
+    }
+
+    /* Check for timeout - delete stale entry */
+    if (now - ps_stats->last_seen > WINDOW_SIZE_NS * 2) {
+        bpf_map_delete_elem(&port_scan_track, &ps_key);
         struct port_scan_stats new_ps = {
             .window_start = now,
             .last_seen = now,

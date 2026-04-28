@@ -598,38 +598,21 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
         /* No existing entry - this is first fragment */
         /* LRU hash will handle eviction when capacity is reached */
 
-        /* Create new tracking entry */
-        struct frag_entry new_entry = {
-            .first_seen = now,
-            .last_seen = now,
-            .total_length = bpf_ntohs(ip->tot_len),
-            .received_length = 0,
-            .fragment_count = 0,
-            .more_fragments = more_fragments,
-            .complete = 0,
-        };
-
         /* Calculate fragment data offset and length */
         frag_data_len = *pkt_len - ip_header_len;
-
-        /* First fragment: initialize tracking */
-        /* We'll use a simple approach: store first fragment inline */
-        /* For BPF compatibility, we store fragment info directly */
-
-        /* Check fragment size limits */
         if (frag_data_len > FRAG_BUFFER_SIZE)
             frag_data_len = FRAG_BUFFER_SIZE;
 
-        /* Allocate buffer and store fragment */
-        /* Use ror32 for better hash distribution to reduce collisions */
-        buf_id = (__u32)((fkey.src_ip << 15) | (fkey.src_ip >> 17)) ^
-                 (__u32)((fkey.dst_ip << 7) | (fkey.dst_ip >> 25)) ^
-                 (__u32)(fkey.ip_id * 0x45d9f3b) ^
-                 (__u32)((fkey.protocol << 16) | (fkey.protocol >> 16));
+        /* Allocate buffer ID */
+        buf_id = compute_frag_buf_id(&fkey);
+        /* Add fragment index to make unique buf_id for each fragment */
+        buf_id ^= (frag_offset << 16);
+
+        /* Store fragment data in frag_buffers */
         struct frag_data fbuf = {
             .session_id = buf_id,
-            .offset = frag_offset * 8,  /* Convert to bytes */
-            .size = frag_data_len,
+            .offset = (__u16)(frag_offset * 8),
+            .size = (__u16)frag_data_len,
         };
 
         ret = bpf_map_update_elem(&frag_buffers, &buf_id, &fbuf, BPF_ANY);
@@ -637,6 +620,26 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
             increment_stat(STATS_PACKETS_DROPPED, 1);
             return XDP_DROP;
         }
+
+        /* Create new tracking entry */
+        struct frag_entry new_entry = {
+            .first_seen = now,
+            .last_seen = now,
+            .total_length = bpf_ntohs(ip->tot_len),
+            .ip_id = ip_id,
+            .frag_count = 1,
+            .complete = 0,
+            .more_fragments = more_fragments,
+            .ip_version = 4,
+            .src_ip = bpf_ntohl(ip->saddr),
+            .dst_ip = bpf_ntohl(ip->daddr),
+            .src_port = 0,
+            .dst_port = 0,
+            .protocol = ip->protocol,
+        };
+        new_entry.frags[0].buf_id = buf_id;
+        new_entry.frags[0].offset = (__u16)(frag_offset * 8);
+        new_entry.frags[0].size = (__u16)frag_data_len;
 
         ret = bpf_map_update_elem(&frag_track, &fkey, &new_entry, BPF_ANY);
         if (ret != 0) {
@@ -651,40 +654,62 @@ static __always_inline int handle_ipv4_defrag(void *data, void *data_end,
 
     /* Existing fragment stream - update entry */
     entry->last_seen = now;
-    entry->fragment_count++;
 
     /* Check for timeout */
     if (now - entry->first_seen > FRAG_TIMEOUT_NS) {
-        /* Timeout - delete entry and buffer */
-        buf_id = compute_frag_buf_id(&fkey);
+        /* Timeout - delete all fragment buffers */
+        for (__u8 i = 0; i < entry->frag_count; i++) {
+            bpf_map_delete_elem(&frag_buffers, &entry->frags[i].buf_id);
+        }
         bpf_map_delete_elem(&frag_track, &fkey);
-        bpf_map_delete_elem(&frag_buffers, &buf_id);
         increment_stat(STATS_PACKETS_PASSED, 1);
         return XDP_PASS;
     }
 
-    /* If this is the last fragment and we have all pieces, reassemble */
-    if (!more_fragments && entry->fragment_count > 0) {
-        /* Check if we have expected number of fragments */
-        /* For simplicity, assume if we got last fragment, reassembly is complete */
-        /* This is a simplified model - real IP defragmentation needs more robust tracking */
+    /* Store this fragment */
+    if (entry->frag_count < MAX_FRAGMENTS) {
+        /* Calculate fragment data */
+        frag_data_len = *pkt_len - ip_header_len;
+        if (frag_data_len > FRAG_BUFFER_SIZE)
+            frag_data_len = FRAG_BUFFER_SIZE;
 
-        /* Mark as complete for stats */
+        /* Allocate unique buffer ID */
+        buf_id = compute_frag_buf_id(&fkey);
+        buf_id ^= ((frag_offset << 16) | (entry->frag_count << 8));
+
+        /* Store fragment data */
+        struct frag_data fbuf = {
+            .session_id = buf_id,
+            .offset = (__u16)(frag_offset * 8),
+            .size = (__u16)frag_data_len,
+        };
+        bpf_map_update_elem(&frag_buffers, &buf_id, &fbuf, BPF_ANY);
+
+        /* Add to fragment array */
+        entry->frags[entry->frag_count].buf_id = buf_id;
+        entry->frags[entry->frag_count].offset = (__u16)(frag_offset * 8);
+        entry->frags[entry->frag_count].size = (__u16)frag_data_len;
+        entry->frag_count++;
+    }
+
+    /* If this is the last fragment, notify user-space for reassembly */
+    if (!more_fragments) {
         entry->complete = 1;
+        entry->total_length = (__u32)(frag_offset * 8 + *pkt_len - ip_header_len);
 
-        /* Reassembly complete - delete tracking and pass packet */
-        buf_id = compute_frag_buf_id(&fkey);
+        /* Send reassembly notification via ringbuf */
+        send_alert(entry->src_ip, entry->dst_ip,
+                   entry->src_port, entry->dst_port,
+                   entry->protocol, SEVERITY_INFO,
+                   entry->frag_count, EVENT_FRAG_REASSEMBLE);
+
+        /* Clean up - in production, user-space would do the reassembly */
+        for (__u8 i = 0; i < entry->frag_count; i++) {
+            bpf_map_delete_elem(&frag_buffers, &entry->frags[i].buf_id);
+        }
         bpf_map_delete_elem(&frag_track, &fkey);
-        bpf_map_delete_elem(&frag_buffers, &buf_id);
-
-        /* Update packet length to indicate reassembled packet */
-        /* Note: In a full implementation, we would copy all fragments to a buffer */
-        /* For this skeleton, we mark it as reassembled and let it proceed */
-        increment_stat(STATS_PACKETS_PASSED, 1);
-        return XDP_PASS;
     }
 
-    /* More fragments expected */
     increment_stat(STATS_PACKETS_PASSED, 1);
     return XDP_PASS;
 }
@@ -774,30 +799,20 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
         /* No existing entry - this is first fragment */
         /* LRU hash will handle eviction when capacity is reached */
 
-        /* Create new tracking entry */
-        struct frag_entry new_entry = {
-            .first_seen = now,
-            .last_seen = now,
-            .total_length = bpf_ntohs(ipv6->payload_len) + sizeof(struct ipv6hdr),
-            .received_length = 0,
-            .fragment_count = 0,
-            .more_fragments = more_fragments,
-            .complete = 0,
-        };
-
         /* Calculate fragment data offset and length */
         frag_data_len = *pkt_len - header_len;
-
-        /* Check fragment size limits */
         if (frag_data_len > FRAG_BUFFER_SIZE)
             frag_data_len = FRAG_BUFFER_SIZE;
 
-        /* Allocate buffer and store fragment */
+        /* Allocate unique buffer ID */
         buf_id = compute_frag_buf_id(&fkey);
+        buf_id ^= (frag_offset << 16);
+
+        /* Store fragment data in frag_buffers */
         struct frag_data fbuf = {
             .session_id = buf_id,
-            .offset = frag_offset * 8,  /* Convert to bytes */
-            .size = frag_data_len,
+            .offset = (__u16)(frag_offset * 8),
+            .size = (__u16)frag_data_len,
         };
 
         ret = bpf_map_update_elem(&frag_buffers, &buf_id, &fbuf, BPF_ANY);
@@ -805,6 +820,26 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
             increment_stat(STATS_PACKETS_DROPPED, 1);
             return XDP_DROP;
         }
+
+        /* Create new tracking entry */
+        struct frag_entry new_entry = {
+            .first_seen = now,
+            .last_seen = now,
+            .total_length = bpf_ntohs(ipv6->payload_len) + sizeof(struct ipv6hdr),
+            .ip_id = ip_id,
+            .frag_count = 1,
+            .complete = 0,
+            .more_fragments = more_fragments,
+            .ip_version = 6,
+            .src_ip = src_ip_arr[0],
+            .dst_ip = dst_ip_arr[0],
+            .src_port = 0,
+            .dst_port = 0,
+            .protocol = ipv6->nexthdr,
+        };
+        new_entry.frags[0].buf_id = buf_id;
+        new_entry.frags[0].offset = (__u16)(frag_offset * 8);
+        new_entry.frags[0].size = (__u16)frag_data_len;
 
         ret = bpf_map_update_elem(&frag_track, &fkey, &new_entry, BPF_ANY);
         if (ret != 0) {
@@ -819,33 +854,62 @@ static __always_inline int handle_ipv6_defrag(void *data, void *data_end,
 
     /* Existing fragment stream - update entry */
     entry->last_seen = now;
-    entry->fragment_count++;
 
     /* Check for timeout */
     if (now - entry->first_seen > FRAG_TIMEOUT_NS) {
-        /* Timeout - delete entry and buffer */
-        buf_id = compute_frag_buf_id(&fkey);
+        /* Timeout - delete all fragment buffers */
+        for (__u8 i = 0; i < entry->frag_count; i++) {
+            bpf_map_delete_elem(&frag_buffers, &entry->frags[i].buf_id);
+        }
         bpf_map_delete_elem(&frag_track, &fkey);
-        bpf_map_delete_elem(&frag_buffers, &buf_id);
         increment_stat(STATS_PACKETS_PASSED, 1);
         return XDP_PASS;
     }
 
-    /* If this is the last fragment and we have all pieces, reassemble */
-    if (!more_fragments && entry->fragment_count > 0) {
-        /* Mark as complete for stats */
+    /* Store this fragment */
+    if (entry->frag_count < MAX_FRAGMENTS) {
+        /* Calculate fragment data */
+        frag_data_len = *pkt_len - header_len;
+        if (frag_data_len > FRAG_BUFFER_SIZE)
+            frag_data_len = FRAG_BUFFER_SIZE;
+
+        /* Allocate unique buffer ID */
+        buf_id = compute_frag_buf_id(&fkey);
+        buf_id ^= ((frag_offset << 16) | (entry->frag_count << 8));
+
+        /* Store fragment data */
+        struct frag_data fbuf = {
+            .session_id = buf_id,
+            .offset = (__u16)(frag_offset * 8),
+            .size = (__u16)frag_data_len,
+        };
+        bpf_map_update_elem(&frag_buffers, &buf_id, &fbuf, BPF_ANY);
+
+        /* Add to fragment array */
+        entry->frags[entry->frag_count].buf_id = buf_id;
+        entry->frags[entry->frag_count].offset = (__u16)(frag_offset * 8);
+        entry->frags[entry->frag_count].size = (__u16)frag_data_len;
+        entry->frag_count++;
+    }
+
+    /* If this is the last fragment, notify user-space for reassembly */
+    if (!more_fragments) {
         entry->complete = 1;
+        entry->total_length = (__u32)(frag_offset * 8 + *pkt_len - header_len);
 
-        /* Reassembly complete - delete tracking and pass packet */
-        buf_id = compute_frag_buf_id(&fkey);
+        /* Send reassembly notification via ringbuf */
+        send_alert(entry->src_ip, entry->dst_ip,
+                   entry->src_port, entry->dst_port,
+                   entry->protocol, SEVERITY_INFO,
+                   entry->frag_count, EVENT_FRAG_REASSEMBLE);
+
+        /* Clean up - in production, user-space would do the reassembly */
+        for (__u8 i = 0; i < entry->frag_count; i++) {
+            bpf_map_delete_elem(&frag_buffers, &entry->frags[i].buf_id);
+        }
         bpf_map_delete_elem(&frag_track, &fkey);
-        bpf_map_delete_elem(&frag_buffers, &buf_id);
-
-        increment_stat(STATS_PACKETS_PASSED, 1);
-        return XDP_PASS;
     }
 
-    /* More fragments expected */
     increment_stat(STATS_PACKETS_PASSED, 1);
     return XDP_PASS;
 }

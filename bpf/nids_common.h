@@ -40,6 +40,7 @@ enum event_type {
     EVENT_FTP_CMD = 10,
     EVENT_TELNET_OPT = 11,
     EVENT_PORT_SCAN = 12,
+    EVENT_FRAG_REASSEMBLE = 13,  /* Fragment reassembly complete, user-space should reassemble */
 };
 
 /* 告警严重级别 */
@@ -335,26 +336,44 @@ struct frag_key {
     __u8  padding[2];
 };
 
-/* Fragment tracking value - stores metadata and fragment data */
+/* Fragment tracking value - stores metadata for up to 8 fragments */
+#define MAX_FRAGMENTS 8
+
+/* Per-fragment metadata stored in frag_entry */
+struct frag_frag_meta {
+    __u32 buf_id;        /* Buffer ID in frag_buffers map */
+    __u16 offset;       /* Fragment offset in bytes */
+    __u16 size;         /* Fragment size in bytes */
+};
+
+/* Fragment tracking value - stores metadata for reassembly */
 struct frag_entry {
     __u64 first_seen;       /* Timestamp of first fragment */
     __u64 last_seen;        /* Timestamp of last fragment */
     __u32 total_length;     /* Total reassembled length (from first frag) */
-    __u32 received_length;  /* Currently received length */
-    __u16 fragment_count;  /* Number of fragments received */
-    __u8  more_fragments;  /* MF flag from first fragment (0=last, 1=more) */
+    __u32 ip_id;            /* IP identification for lookup */
+    __u8  frag_count;       /* Number of fragments received */
     __u8  complete;         /* Reassembly complete flag */
-    __u8  padding[2];
-    /* Fragment data stored inline after this structure */
-    /* Layout: [frag1_offset:16][frag1_size:16][frag1_data...] */
+    __u8  more_fragments;   /* MF flag from first fragment */
+    __u8  ip_version;       /* IP version (4 or 6) */
+    /* 5-tuple for user-space lookup */
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  protocol;
+    __u8  padding;
+    struct frag_frag_meta frags[MAX_FRAGMENTS];  /* Fragment metadata array */
 };
 
-/* Fragment data buffer - stored separately due to size */
+/* Fragment data buffer - stores actual fragment data */
 struct frag_data {
     __u32 session_id;      /* Index into frag_track */
     __u16 offset;          /* Fragment offset in bytes */
     __u16 size;            /* Fragment size in bytes */
     __u8  padding[4];
+    /* Actual fragment data stored inline */
+    /* Data size is limited by FRAG_BUFFER_SIZE */
 };
 
 /* Fragment tracking map - LRU hash to auto-evict old fragments */

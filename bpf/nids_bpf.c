@@ -1168,6 +1168,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     struct flow_key key = {};
     __u32 pkt_len = 0;
     __u8 tcp_flags = 0;
+    __u64 now = bpf_ktime_get_ns();
     int ret;
 
     /* 检查是否启用 */
@@ -1312,8 +1313,16 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                 }
             }
 
-            /* IPv6: Continue to flow tracking with truncated IPs, then pass */
-            /* Note: Flow tracking for IPv6 uses first 32 bits of IPs (key src_ip/dst_ip will be 0 from parse_packet) */
+            /* IPv6: Call flow tracking and then pass */
+            /* Populate key struct for flow tracking */
+            key.src_ip = ipv6_src_ip;
+            key.dst_ip = ipv6_dst_ip;
+            key.src_port = ipv6_src_port;
+            key.dst_port = ipv6_dst_port;
+            key.protocol = ipv6_protocol;
+            normalize_flow_key(&key);
+            update_flow_stats(&key, ipv6_pkt_len, now);
+
             increment_stat(STATS_PACKETS_TOTAL, 1);
             return XDP_PASS;
         }

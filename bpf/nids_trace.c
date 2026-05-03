@@ -34,6 +34,8 @@
 static __always_inline void update_fd_count(__u32 pid, __u8 type, int increment);
 static __always_inline __u8 get_fd_type(__u32 pid, __u32 fd);
 static __always_inline void remove_fd_type(__u32 pid, __u32 fd);
+static __always_inline void add_proc_sock(__u32 fd, __u32 pid, __u32 family, __u32 ip, __u16 port, __u8 protocol);
+static __always_inline void remove_proc_sock(__u32 fd);
 
 enum proc_event_type {
     PROC_EVENT_CONNECT = 0,
@@ -79,7 +81,8 @@ static __always_inline int send_process_event_ringbuf(__u32 pid, __u32 tid, __u3
                                                      __u32 fd, __u8 event_type,
                                                      __u8 addr_family, __u8 protocol,
                                                      __u32 src_ip, __u32 dst_ip,
-                                                     __u16 src_port, __u16 dst_port) {
+                                                     __u16 src_port, __u16 dst_port,
+                                                     __u8 socket_type, __u64 bytes) {
     struct process_event *event;
 
     event = bpf_ringbuf_reserve(&process_events, sizeof(*event), 0);
@@ -95,10 +98,12 @@ static __always_inline int send_process_event_ringbuf(__u32 pid, __u32 tid, __u3
     event->event_type = event_type;
     event->addr_family = addr_family;
     event->protocol = protocol;
+    event->socket_type = socket_type;
     event->src_ip = src_ip;
     event->dst_ip = dst_ip;
     event->src_port = src_port;
     event->dst_port = dst_port;
+    event->bytes = bytes;
 
     bpf_ringbuf_submit(event, 0);
     return 0;
@@ -162,7 +167,12 @@ static __always_inline int handle_connect_enter(struct trace_event_raw_sys_enter
     }
 
     send_process_event_ringbuf(pid, tid, uid, fd, EVENT_PROCESS_CONNECT,
-                              addr_family, protocol, src_ip, dst_ip, src_port, dst_port);
+                              addr_family, protocol, src_ip, dst_ip, src_port, dst_port, 0, 0);
+
+    /* Add to proc_sock_map for process-socket correlation */
+    if (fd > 0) {
+        add_proc_sock(fd, pid, addr_family, dst_ip, dst_port, protocol);
+    }
 
     return 0;
 }
@@ -227,13 +237,16 @@ static __always_inline int handle_close_enter(struct trace_event_raw_sys_enter *
     fd = (__u32)PT_REGS_PARM1(ctx);
 
     send_process_event_ringbuf(pid, tid, uid, fd, EVENT_PROCESS_CLOSE,
-                              0, 0, 0, 0, 0, 0);
+                              0, 0, 0, 0, 0, 0, 0, 0);
 
     __u8 type = get_fd_type(pid, fd);
     if (type != FD_TYPE_UNKNOWN) {
         update_fd_count(pid, type, 0);
         remove_fd_type(pid, fd);
     }
+
+    /* Remove from proc_sock_map */
+    remove_proc_sock(fd);
 
     return 0;
 }
@@ -459,6 +472,31 @@ static __always_inline void remove_fd_type(__u32 pid, __u32 fd)
     bpf_map_delete_elem(&fd_type_track, &key);
 }
 
+/*
+ * Add a socket to the process-socket mapping table
+ */
+static __always_inline void add_proc_sock(__u32 fd, __u32 pid, __u32 family, __u32 ip, __u16 port, __u8 protocol)
+{
+    struct proc_sock_entry entry = {
+        .pid = pid,
+        .fd = fd,
+        .family = family,
+        .ip = ip,
+        .port = port,
+        .protocol = protocol,
+        .padding = {0}
+    };
+    bpf_map_update_elem(&proc_sock_map, &fd, &entry, BPF_ANY);
+}
+
+/*
+ * Remove a socket from the process-socket mapping table
+ */
+static __always_inline void remove_proc_sock(__u32 fd)
+{
+    bpf_map_delete_elem(&proc_sock_map, &fd);
+}
+
 static __always_inline int handle_enter_openat(struct trace_event_raw_sys_enter *ctx)
 {
     return 0;
@@ -466,6 +504,41 @@ static __always_inline int handle_enter_openat(struct trace_event_raw_sys_enter 
 
 static __always_inline int handle_enter_socket(struct trace_event_raw_sys_enter *ctx)
 {
+    __u32 pid, tid, uid;
+    __u32 fd;
+    __u32 family;
+    __u32 type;
+    __u32 protocol;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    pid = (__u32)(pid_tgid >> 32);
+    tid = (__u32)(pid_tgid & 0xFFFFFFFF);
+
+    __u32 uid_gid = bpf_get_current_uid_gid();
+    uid = uid_gid >> 16;
+
+    fd = (__u32)PT_REGS_PARM1(ctx);
+    family = (__u32)PT_REGS_PARM2(ctx);
+    type = (__u32)PT_REGS_PARM3(ctx);
+    /* protocol is in reg 4, but we don't have easy access, default to 0 */
+    protocol = 0;
+
+    /* Track the socket type for FD type correlation */
+    if (fd > 0) {
+        track_fd_type(pid, fd, FD_TYPE_SOCKET);
+        update_fd_count(pid, FD_TYPE_SOCKET, 1);
+    }
+
+    /* Send socket creation event */
+    send_process_event_ringbuf(pid, tid, uid, fd, EVENT_PROCESS_SOCKET,
+                              (__u8)family, (__u8)protocol, 0, 0, 0, 0,
+                              (__u8)type, 0);
+
+    /* Add to proc_sock_map with available info */
+    if (fd > 0) {
+        add_proc_sock(fd, pid, family, 0, 0, (__u8)protocol);
+    }
+
     return 0;
 }
 
@@ -536,6 +609,70 @@ static __always_inline int handle_enter_write(struct trace_event_raw_sys_enter *
 
 BPF_TRACE_sys_enter(read, handle_enter_read);
 BPF_TRACE_sys_enter(write, handle_enter_write);
+
+/*
+ * P-02: System Call Network Monitoring
+ * Track send/recv syscalls for socket I/O monitoring
+ */
+
+static __always_inline int handle_enter_send(struct trace_event_raw_sys_enter *ctx)
+{
+    __u32 pid, tid, uid;
+    __u32 fd;
+    __u64 size;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    pid = (__u32)(pid_tgid >> 32);
+    tid = (__u32)(pid_tgid & 0xFFFFFFFF);
+
+    __u32 uid_gid = bpf_get_current_uid_gid();
+    uid = uid_gid >> 16;
+
+    fd = (__u32)PT_REGS_PARM1(ctx);
+    /* ptr to buffer - we can't read it, just track size */
+    /* size is in param 3 */
+    size = (__u64)PT_REGS_PARM3(ctx);
+
+    /* Send send event with byte count */
+    send_process_event_ringbuf(pid, tid, uid, fd, EVENT_PROCESS_SEND,
+                              0, 0, 0, 0, 0, 0, 0, size);
+
+    /* Also update io_monitor for aggregated stats */
+    update_io_track(pid, size, 0);
+
+    return 0;
+}
+
+static __always_inline int handle_enter_recv(struct trace_event_raw_sys_enter *ctx)
+{
+    __u32 pid, tid, uid;
+    __u32 fd;
+    __u64 size;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    pid = (__u32)(pid_tgid >> 32);
+    tid = (__u32)(pid_tgid & 0xFFFFFFFF);
+
+    __u32 uid_gid = bpf_get_current_uid_gid();
+    uid = uid_gid >> 16;
+
+    fd = (__u32)PT_REGS_PARM1(ctx);
+    /* ptr to buffer - we can't read it, just track size */
+    /* size is in param 3 */
+    size = (__u64)PT_REGS_PARM3(ctx);
+
+    /* Send recv event with byte count */
+    send_process_event_ringbuf(pid, tid, uid, fd, EVENT_PROCESS_RECV,
+                              0, 0, 0, 0, 0, 0, 0, size);
+
+    /* Also update io_monitor for aggregated stats */
+    update_io_track(pid, size, 1);
+
+    return 0;
+}
+
+BPF_TRACE_sys_enter(send, handle_enter_send);
+BPF_TRACE_sys_enter(recv, handle_enter_recv);
 
 struct iovec {
     void *iov_base;

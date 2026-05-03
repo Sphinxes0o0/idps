@@ -45,20 +45,31 @@ void RingbufReader::start(int timeout_ms) {
     running_ = true;
     LOG_INFO("ringbuf", "started polling on map fd %d", map_fd_);
 
-    // 轮询循环
+    // 批处理轮询循环
     while (running_.load()) {
-        int err = ring_buffer__poll(rb_, timeout_ms);
-        if (err < 0 && err != -EINTR) {
+        int n = poll_events(timeout_ms);
+        if (n < 0 && n != -EINTR) {
             if (running_.load()) {
-                LOG_ERR("ringbuf", "ring_buffer__poll error: %s", strerror(-err));
+                LOG_ERR("ringbuf", "poll_events error: %s", strerror(-n));
             }
             break;
         }
-        // ring_buffer__poll 会调用注册的回调处理所有可用事件
+        // poll_events 批量获取并处理所有可用事件
     }
 
     running_ = false;
     LOG_INFO("ringbuf", "stopped");
+}
+
+int RingbufReader::poll_events(int timeout_ms) {
+    // 使用 ring_buffer__poll 进行单次轮询，内部处理回调
+    // timeout_ms 转换为毫秒，-1 表示阻塞
+    int ret = ring_buffer__poll(rb_, timeout_ms);
+    if (ret < 0) {
+        return ret;
+    }
+    // 返回已处理的事件数（由回调统计）
+    return processed_count_;
 }
 
 void RingbufReader::stop() {

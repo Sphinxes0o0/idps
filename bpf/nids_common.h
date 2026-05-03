@@ -46,6 +46,13 @@ enum event_type {
     EVENT_RST_FLOOD = 16,       /* TCP RST flood detected */
     EVENT_PROCESS_CONNECT = 17,  /* Process connect() syscall */
     EVENT_PROCESS_CLOSE = 18,    /* Process close() syscall */
+    EVENT_PROCESS_SOCKET = 19,    /* Process socket() syscall */
+    EVENT_PROCESS_SEND = 20,     /* Process send() syscall */
+    EVENT_PROCESS_RECV = 21,     /* Process recv() syscall */
+    EVENT_SLOWLORIS = 22,       /* Slowloris/Slow POST attack detected */
+    EVENT_TLS_WRITE = 23,       /* TLS/SSL write activity */
+    EVENT_TLS_READ = 24,        /* TLS/SSL read activity */
+    EVENT_SMTP_CMD = 25,        /* SMTP command detected */
 };
 
 /* 告警严重级别 */
@@ -93,7 +100,8 @@ struct src_track {
     __u64 last_seen;        /* 最后包时间 */
     __u64 window_start;     /* 窗口起始时间 */
     __u8  flags;           /* 标志位 */
-    __u8  padding[7];
+    __u8  padding[3];
+    __u32 pid;              /* 关联的进程 ID (当进程调用 connect() 时记录) */
 };
 
 /*
@@ -184,6 +192,8 @@ enum stats_index {
     STATS_ACK_FLOOD_ALERTS = 14,
     STATS_FIN_FLOOD_ALERTS = 15,
     STATS_RST_FLOOD_ALERTS = 16,
+    STATS_SLOWLORIS_ALERTS = 17,
+    STATS_SMTP_CMD = 18,
     STATS_MAX = 256,
 };
 
@@ -229,6 +239,28 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);  /* 256KB ring buffer */
 } events SEC(".maps");
+
+/*
+ * fast_alert_event - 快速告警事件结构 (精简版，用于 DDoS 快速路径)
+ * 比 alert_event 更小，专用 ringbuf 无锁竞争
+ */
+struct fast_alert_event {
+    __u64 timestamp;
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  protocol;
+    __u8  severity;
+    __u32 rule_id;
+    __u8  event_type;
+};
+
+/* 快速告警事件 Ringbuf (独立于 events 的专用 ringbuf) */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 128 * 1024);  /* 128KB ring buffer for fast path */
+} fast_alerts SEC(".maps");
 
 /* Alert rate limiting - tracks last alert time per source IP for DDoS alerts */
 struct alert_rate_key {
@@ -342,6 +374,31 @@ struct {
     __type(value, struct src_track);
 } tcp_rst_flood_track SEC(".maps");
 
+/*
+ * Slowloris/Slow POST attack detection
+ * Tracks HTTP connections and detects slow data transmission
+ */
+
+/* Slow HTTP tracking stats */
+struct slow_http_stats {
+    __u64 last_packet_time;  /* Timestamp of last packet */
+    __u64 connection_start; /* Timestamp when connection was established */
+    __u8  alert_sent;       /* Alert has been sent for this connection */
+    __u8  padding[7];
+};
+
+/* Slow HTTP tracking table - LRU Hash (key = flow_key) */
+/* Tracks packet intervals on HTTP connections to detect Slowloris/Slow POST attacks */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);
+    __type(value, struct slow_http_stats);
+} slow_http_track SEC(".maps");
+
+/* Slowloris detection threshold - 10 seconds in nanoseconds */
+#define SLOWLORIS_THRESHOLD_NS 10000000000ULL
+
 /* 规则索引 key: (protocol << 16) | dst_port */
 struct rule_index_key {
     __u32 proto_port;  /* (protocol << 16) | port */
@@ -354,6 +411,19 @@ struct {
     __type(key, struct rule_index_key);
     __type(value, __u32);  /* rule_id */
 } rule_index SEC(".maps");
+
+/*
+ * 规则匹配计数表 - 用于无锁 RCU 风格规则匹配
+ * 使用 atomic fetch-add 操作实现无锁计数
+ * key: rule_id
+ * value: match count (atomic increment via __sync_fetch_and_add)
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_RULES);
+    __type(key, __u32);   /* rule_id */
+    __type(value, __u64); /* match count */
+} rule_match_count SEC(".maps");
 
 /*
  * IP Defragmentation
@@ -430,7 +500,7 @@ struct frag_data {
 };
 
 /*
- * process_event - Process lifecycle event (connect/close)
+ * process_event - Process lifecycle event (connect/close/socket/send/recv)
  * Sent via ringbuf for tracking process network activity
  */
 struct process_event {
@@ -438,15 +508,16 @@ struct process_event {
     __u32 pid;            /* Process ID */
     __u32 tid;            /* Thread ID */
     __u32 uid;            /* User ID */
-    __u32 fd;             /* File descriptor (socket fd for connect, closed fd for close) */
-    __u8  event_type;     /* EVENT_PROCESS_CONNECT or EVENT_PROCESS_CLOSE */
+    __u32 fd;             /* File descriptor (socket fd, closed fd, or send/recv fd) */
+    __u8  event_type;     /* EVENT_PROCESS_CONNECT, EVENT_PROCESS_CLOSE, EVENT_PROCESS_SOCKET, etc. */
     __u8  addr_family;    /* AF_INET or AF_INET6 */
-    __u8  protocol;       /* IPPROTO_TCP, IPPROTO_UDP, or 0 for close */
-    __u8  padding;
+    __u8  protocol;       /* IPPROTO_TCP, IPPROTO_UDP, etc. */
+    __u8  socket_type;   /* SOCK_STREAM, SOCK_DGRAM, etc. (for socket events) */
     __u32 src_ip;         /* Source IP (network byte order for IPv4, first 32 bits for IPv6) */
     __u32 dst_ip;         /* Destination IP */
     __u16 src_port;       /* Source port */
     __u16 dst_port;       /* Destination port */
+    __u64 bytes;          /* Bytes sent/recv'd (for send/recv events) */
 };
 
 /* Fragment tracking map - LRU hash to auto-evict old fragments */
@@ -508,5 +579,183 @@ struct {
     __type(key, struct fd_type_key);
     __type(value, struct fd_type_val);
 } fd_type_track SEC(".maps");
+
+/*
+ * P-05: DNS Query Process Tracking
+ *
+ * Tracks getaddrinfo/gethostbyname calls to correlate DNS queries with processes.
+ * Key: pid (process ID)
+ * Value: hostname being resolved
+ */
+
+/* DNS process tracking - key: PID */
+struct dns_query_key {
+    __u32 pid;
+};
+
+/* DNS query info - hostname being resolved */
+struct dns_query_info {
+    __u64 timestamp;
+    char hostname[128];  /* Maximum hostname length */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);  /* Track up to 16K concurrent DNS queries */
+    __type(key, struct dns_query_key);
+    __type(value, struct dns_query_info);
+} dns_query_track SEC(".maps");
+
+/*
+ * syn_flood_src_pid - SYN flood 源进程追踪
+ * 记录每个源 IP 最近发起连接的进程 ID
+ * 用于在检测到 SYN flood 时关联攻击源进程
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);  /* src_ip */
+    __type(value, __u32);  /* pid */
+} syn_flood_src_pid SEC(".maps");
+
+/*
+ * P-04: TLS Connection Process Attribution
+ *
+ * Tracks SSL_write/SSL_read calls to correlate TLS connections with processes.
+ * Key: SSL pointer address (userspace pointer)
+ * Value: PID, FD, and connection info
+ */
+
+/* TLS connection tracking key - SSL pointer */
+struct tls_conn_key {
+    __u64 ssl_ptr;  /* SSL* pointer from tracepoint */
+};
+
+/* TLS connection info */
+struct tls_conn_info {
+    __u32 pid;           /* Process ID */
+    __u32 tid;           /* Thread ID */
+    __u32 fd;            /* Socket file descriptor (if available) */
+    __u64 timestamp;     /* Last activity timestamp */
+    __u32 src_ip;        /* Source IP */
+    __u32 dst_ip;        /* Destination IP */
+    __u16 src_port;      /* Source port */
+    __u16 dst_port;      /* Destination port */
+};
+
+/* TLS connection tracking map - LRU Hash */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);  /* Max concurrent TLS connections */
+    __type(key, struct tls_conn_key);
+    __type(value, struct tls_conn_info);
+} tls_conn_track SEC(".maps");
+
+
+/*
+ * P-01: 进程感知流量监控
+ *
+ * process_info - 存储进程 connect() 系统调用信息
+ * 用于在 XDP 处理时关联 packet 与进程
+ *
+ * Key: flow_key (src_ip, dst_ip, src_port, dst_port, protocol)
+ * Value: process information (pid, uid, fd, timestamp)
+ */
+struct process_info {
+    __u32 pid;           /* Process ID */
+    __u32 uid;           /* User ID */
+    __u32 fd;            /* Socket file descriptor */
+    __u64 timestamp;     /* Last update timestamp */
+    __u8  addr_family;   /* AF_INET or AF_INET6 */
+    __u8  protocol;      /* IPPROTO_TCP or IPPROTO_UDP */
+    __u8  padding[2];
+};
+
+/* Process tracking map - keyed by 5-tuple for XDP lookup */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);  /* Max concurrent tracked connections */
+    __type(key, struct flow_key);
+    __type(value, struct process_info);
+} process_map SEC(".maps");
+
+/*
+ * R-04: SMTP Session State Tracking
+ *
+ * Tracks SMTP session state per flow to detect command sequences:
+ *   CONNECT -> EHLO/HELO -> AUTH -> USER -> PASS -> DATA
+ *
+ * SMTP ports: 25 (SMTP), 587 (Submission), 465 (SMTPS)
+ */
+
+/* SMTP state machine states */
+enum smtp_state {
+    SMTP_CONNECT = 0,    /* 220 banner received - connection established */
+    SMTP_EHLO = 1,       /* EHLO/HELO received - session started */
+    SMTP_AUTH = 2,        /* AUTH command received - authentication started */
+    SMTP_USER = 3,       /* AUTH LOGIN - username submitted */
+    SMTP_PASS = 4,       /* AUTH LOGIN - password submitted */
+    SMTP_DATA = 5,       /* DATA command - mail body follows */
+    SMTP_UNKNOWN = 6,    /* Unknown/invalid state */
+};
+
+/* SMTP tracking key - based on flow 5-tuple */
+struct smtp_track_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+};
+
+/* SMTP tracking value - stores session state and metadata */
+struct smtp_track_value {
+    __u8 state;           /* Current SMTP state (enum smtp_state) */
+    __u8 padding[3];
+    __u64 last_seen;      /* Last packet timestamp */
+    __u32 command_count;  /* Number of commands in session */
+};
+
+/* SMTP session tracking table - LRU Hash */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);  /* Max concurrent SMTP sessions */
+    __type(key, struct smtp_track_key);
+    __type(value, struct smtp_track_value);
+} smtp_track SEC(".maps");
+
+/*
+ * P-03: Process Socket Mapping Table
+ *
+ * Tracks which process (pid) has which socket (fd) with its address info.
+ * Used for correlating network activity with processes.
+ * Key: file descriptor (fd)
+ * Value: process information (pid, fd, address info)
+ */
+
+/* Process to socket mapping entry */
+struct proc_sock_entry {
+    __u32 pid;           /* Process ID */
+    __u32 fd;            /* Socket file descriptor */
+    __u32 family;        /* AF_INET or AF_INET6 */
+    __u32 ip;            /* IP address (network byte order) */
+    __u16 port;          /* Port (network byte order) */
+    __u8  protocol;      /* IPPROTO_TCP, IPPROTO_UDP, etc. */
+    __u8  padding[3];
+};
+
+/* Process to socket mapping table - keyed by fd */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);  /* fd */
+    __type(value, struct proc_sock_entry);
+} proc_sock_map SEC(".maps");
+
+/*
+ * P-02: System Call Network Monitoring
+ *
+ * Extended process_event structure for socket/send/recv syscalls.
+ * Uses existing process_events ringbuf for transport.
+ */
 
 #endif /* NIDS_COMMON_H */

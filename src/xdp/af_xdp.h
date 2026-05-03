@@ -149,11 +149,58 @@ struct QuicInfo {
 };
 
 /**
+ * @brief WebSocket 帧信息 (R-03)
+ *
+ * WebSocket frame format (RFC 6455):
+ * - Byte 0: FIN(1) + opcode(4) + RSV(3)
+ * - Byte 1: MASK(1) + payload_len(7)
+ * - Extended length (if payload_len == 126 or 127)
+ * - Masking key (if MASK bit set, 4 bytes)
+ * - Payload data
+ *
+ * Opcodes: 0x0=continuation, 0x1=text, 0x2=binary, 0x8=close, 0x9=ping, 0xA=pong
+ */
+struct WebSocketFrame {
+    bool fin;               ///< FIN bit: true = final fragment
+    uint8_t opcode;         ///< Opcode: 0x0=continuation, 0x1=text, 0x2=binary, 0x8=close, 0x9=ping, 0xA=pong
+    bool masked;            ///< MASK bit: true = client-to-server frame
+    uint64_t payload_len;   ///< Payload length (up to 64-bit extended)
+    size_t header_len;     ///< Total header length (including extended length and mask key)
+};
+
+/*
+ * R-05: MQTT Protocol Analysis
+ *
+ * MQTT protocol structure:
+ * - Fixed header: message_type(4) + flags(4) + remaining_length (1-4 bytes)
+ * - Variable header: depends on message type
+ * - Payload: depends on message type
+ *
+ * MQTT Message Types:
+ * - 1: CONNECT (client -> server, connection request)
+ * - 2: CONNACK (server -> client, connection ack)
+ * - 3: PUBLISH (bidirectional)
+ * - 8: SUBSCRIBE (client -> server, subscribe request)
+ * - 9: SUBACK (server -> client, subscribe ack)
+ */
+struct MqttInfo {
+    uint8_t type;           // CONNECT(1), CONNACK(2), PUBLISH(3), SUBSCRIBE(8), etc.
+    uint8_t flags;          // Flags from fixed header
+    uint16_t keepalive;     // Keep-alive timer (seconds)
+    std::string client_id;  // Client identifier
+    std::string username;   // Username (if present in CONNECT)
+    std::string password;   // Password (if present in CONNECT)
+    std::string topic;      // Topic for PUBLISH/SUBSCRIBE
+    uint8_t qos;           // QoS level (0, 1, or 2)
+};
+
+/**
  * @brief AF_XDP 配置
  */
 struct XdpConfig {
     std::string iface;       ///< 网络接口名
     uint32_t queue_id = 0;  ///< 队列 ID
+    uint32_t num_queues = 1;  ///< O-04: 多核负载均衡 - 队列数量
     uint32_t num_frames = 4096;  ///< UMEM 帧数量
     uint32_t frame_size = 2048;   ///< 每个帧的大小
     bool use_fill_ring = true;    ///< 是否使用 fill ring
@@ -368,10 +415,25 @@ private:
     void detect_ftp_data_connection(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len);
 
     /*
+     * R-03: WebSocket frame parsing
+     * Parses WebSocket frame header and returns frame metadata.
+     * Handles fragmentation by tracking frame state.
+     */
+    bool parse_websocket_frame(const uint8_t* data, size_t len, WebSocketFrame& frame);
+
+    /*
      * F-23: WebSocket frame detection
      * Parses WebSocket frame headers to detect fragmented/mixed frames
      */
     void detect_websocket(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len);
+
+    /*
+     * N-05: SSH Brute Force Detection
+     * Detects SSH login failure attempts by tracking authentication failure messages.
+     * SSH servers typically send "Permission denied", "Invalid password", or
+     * "Authentication failed" messages on failed login attempts.
+     */
+    void detect_ssh_bruteforce(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len);
 
     /*
      * F-04: DNS Tunneling Detection
@@ -391,6 +453,100 @@ private:
      * @return true if QUIC header detected
      */
     bool parse_quic_header(const uint8_t* data, size_t len, QuicInfo& info);
+
+    /*
+     * R-05: MQTT Protocol Analysis
+     *
+     * Parses MQTT packets on ports 1883 (unencrypted) and 8883 (TLS).
+     * Extracts connection info (client_id, username) from CONNECT packets,
+     * topic names from PUBLISH/SUBSCRIBE packets.
+     */
+    bool parse_mqtt(const uint8_t* data, size_t len, MqttInfo& info);
+
+    /*
+     * R-02: HTTP/2 Multiplexed Stream Analysis
+     *
+     * HTTP/2 frame structure (RFC 7540):
+     * - Length (3 bytes): payload length
+     * - Type (1 byte): frame type
+     * - Flags (1 byte): frame-specific flags
+     * - Stream ID (4 bytes): stream identifier
+     */
+    struct Http2FrameInfo {
+        uint32_t length;      // Payload length (3 bytes)
+        uint8_t type;        // Frame type (0x0-0x9)
+        uint8_t flags;        // Frame flags
+        uint32_t stream_id;  // Stream identifier
+        uint32_t frame_size; // Total frame size (header + payload)
+        bool padded;         // Padded frame (HEADERS, DATA)
+        bool has_priority;   // Has priority information (HEADERS)
+    };
+
+    /*
+     * R-02: HTTP/2 connection and stream tracking
+     * Detects anomalies in HTTP/2 multiplexed streams
+     */
+    struct Http2ConnectionKey {
+        uint32_t src_ip;
+        uint32_t dst_ip;
+        uint16_t src_port;
+        uint16_t dst_port;
+
+        bool operator<(const Http2ConnectionKey& other) const {
+            if (src_ip != other.src_ip) return src_ip < other.src_ip;
+            if (dst_ip != other.dst_ip) return dst_ip < other.dst_ip;
+            if (src_port != other.src_port) return src_port < other.src_port;
+            return dst_port < other.dst_port;
+        }
+    };
+    struct Http2ConnectionData {
+        uint64_t connection_initiated;  // Connection start time
+        uint64_t last_seen;           // Last frame seen
+        uint32_t total_streams;          // Total streams created
+        uint32_t concurrent_streams;     // Currently open streams
+        uint32_t last_stream_id;         // Last stream ID seen
+        bool settings_received;          // SETTINGS frame received
+        bool goaway_sent;                // GOAWAY sent
+        bool alert_sent;                 // Alert sent for this connection
+        uint32_t rst_flood_count;         // RST_STREAM flood counter
+        uint32_t settings_count;         // SETTINGS frame counter
+    };
+    struct Http2StreamData {
+        uint32_t stream_id;     // Stream identifier
+        uint64_t created;       // Stream creation time
+        uint64_t last_seen;    // Last frame on this stream
+        bool headers_sent;      // HEADERS frame sent
+        bool data_received;     // DATA frame received
+        bool closed;            // Stream closed
+    };
+
+    /**
+     * @brief Parse HTTP/2 frame header
+     * @param data TCP payload data
+     * @param len TCP payload length
+     * @param info [out] Parsed HTTP/2 frame info
+     * @return true if valid HTTP/2 frame detected
+     */
+    bool parse_http2_frame(const uint8_t* data, size_t len, Http2FrameInfo& info);
+
+    /**
+     * @brief Detect HTTP/2 anomalies and track streams
+     * @param pkt Packet info
+     * @param payload TCP payload data
+     * @param payload_len TCP payload length
+     */
+    void detect_http2(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len);
+
+    /* HTTP/2 detection constants */
+    static constexpr uint32_t HTTP2_MAX_CONCURRENT_STREAMS = 100;  // RFC 7540 minimum
+    static constexpr uint32_t HTTP2_RST_FLOOD_THRESHOLD = 50;       // RST_STREAM flood limit
+    static constexpr uint32_t HTTP2_SETTINGS_FLOOD_THRESHOLD = 20;  // SETTINGS flood limit
+    static constexpr uint32_t HTTP2_STREAM_TIMEOUT_MS = 120000;     // 2 minute stream timeout
+    static constexpr uint32_t HTTP2_MAX_FRAME_SIZE = 16384;         // 16KB max frame (RFC 7540)
+
+    // Maps to track HTTP/2 connections and streams
+    std::map<Http2ConnectionKey, Http2ConnectionData, std::less<>> http2_connections_;
+    std::map<Http2ConnectionKey, Http2StreamData, std::less<>> http2_streams_;
 
     struct TlsVersionRule { uint16_t version; int rule_id; std::string message; };
     struct SniRule { std::string pattern; int rule_id; std::string message; };
@@ -511,6 +667,33 @@ private:
     std::map<WebSocketKey, WebSocketData, std::less<>> websocket_connections_;
     static constexpr uint32_t WEBSOCKET_TIMEOUT_MS = 120000;  // 2 minute timeout
 
+    /*
+     * N-05: SSH Brute Force Detection
+     * Tracks SSH authentication failures per source IP to detect brute force attacks.
+     * SSH servers send "Permission denied", "Invalid password", or
+     * "Authentication failed" messages on failed login attempts.
+     */
+    struct SshBruteForceKey {
+        uint32_t src_ip;     // Attacker source IP
+        uint32_t dst_ip;     // Target SSH server IP
+
+        bool operator<(const SshBruteForceKey& other) const {
+            if (src_ip != other.src_ip) return src_ip < other.src_ip;
+            return dst_ip < other.dst_ip;
+        }
+    };
+    struct SshBruteForceData {
+        uint32_t fail_count;       // Number of failed attempts in window
+        uint64_t window_start;      // Window start timestamp (ms)
+        uint64_t last_failure;      // Last failure timestamp
+        bool alert_sent;           // Alert sent for this source
+    };
+    // Map to track SSH brute force attempts (keyed by src_ip, dst_ip)
+    std::map<SshBruteForceKey, SshBruteForceData, std::less<>> ssh_brute_force_;
+    static constexpr uint32_t SSH_BRUTE_FORCE_THRESHOLD = 5;   // 5 failures
+    static constexpr uint32_t SSH_BRUTE_FORCE_WINDOW_MS = 60000;  // 1 minute window
+    static constexpr uint32_t SSH_BRUTE_FORCE_TIMEOUT_MS = 300000;  // 5 minute timeout
+
     int sock_fd_;
     bool opened_;
     std::atomic<bool> running_;
@@ -549,6 +732,74 @@ private:
     struct xdp_desc* fill_ring_ = nullptr;  ///< mmap'd fill ring
     struct xdp_desc* completion_ring_ = nullptr;  ///< mmap'd completion ring
     uint64_t umem_size_;
+
+    /*
+     * O-04: Multi-core Load Balancing
+     *
+     * Uses RSS (Receive Side Scaling) hash to distribute flows across
+     * multiple AF_XDP queues for parallel processing on different cores.
+     *
+     * Flow hash is computed from 5-tuple (src_ip, dst_ip, src_port, dst_port, protocol)
+     * and then modulo'd by number of queues to determine which queue handles the flow.
+     */
+    uint32_t num_queues_ = 1;  ///< Number of queues for multi-core processing
+    std::vector<int> sock_fds_;  ///< Socket per queue (multi-queue mode)
+    std::vector<struct xdp_desc*> fill_rings_;  ///< Fill ring per queue
+    std::vector<struct xdp_desc*> completion_rings_;  ///< Completion ring per queue
+    std::vector<struct xdp_ring_offsets> ring_offsets_vec_;  ///< Ring offsets per queue
+
+    /**
+     * @brief Compute flow hash from 5-tuple (RSS-style)
+     *
+     * Uses a simple hash based on Jenkins hash algorithm adapted for
+     * network flow identification. The hash considers all 5-tuple
+     * components to ensure good distribution across queues.
+     *
+     * @param src_ip Source IP (host byte order for IPv4, first 32 bits for IPv6)
+     * @param dst_ip Destination IP (host byte order for IPv4, first 32 bits for IPv6)
+     * @param src_port Source port (0 if not applicable)
+     * @param dst_port Destination port (0 if not applicable)
+     * @param protocol IP protocol number
+     * @return 32-bit hash value
+     */
+    static uint32_t flow_hash(uint32_t src_ip, uint32_t dst_ip,
+                              uint16_t src_port, uint16_t dst_port,
+                              uint8_t protocol);
+
+    /**
+     * @brief Get queue index for a flow using RSS-style hashing
+     * @param src_ip Source IP
+     * @param dst_ip Destination IP
+     * @param src_port Source port
+     * @param dst_port Destination port
+     * @param protocol Protocol
+     * @return Queue index (0 to num_queues_-1)
+     */
+    uint32_t get_flow_queue(uint32_t src_ip, uint32_t dst_ip,
+                            uint16_t src_port, uint16_t dst_port,
+                            uint8_t protocol) const {
+        uint32_t hash = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
+        return hash % num_queues_;
+    }
+
+    /**
+     * @brief Setup multi-queue mode for RSS-based load balancing
+     * @param ifindex Network interface index
+     * @param base_queue Starting queue ID
+     * @param num_queues Number of queues to create
+     * @return true if successful
+     */
+    bool setup_multiqueue(int ifindex, uint32_t base_queue, uint32_t num_queues);
+
+    /**
+     * @brief Get current queue statistics for load balancing monitoring
+     */
+    struct QueueStats {
+        uint64_t packets_processed;
+        uint64_t bytes_processed;
+        uint64_t drops;
+    };
+    std::vector<QueueStats> queue_stats_;  ///< Per-queue statistics
 };
 
 } // namespace nids

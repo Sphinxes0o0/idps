@@ -318,15 +318,16 @@ bool EbpfLoader::load_bpf_object(const std::string& path) {
 }
 
 /*
- * P-01: attach_tracepoints - Attach tracepoint programs for process tracking
+ * P-01/P-02: attach_tracepoints - Attach tracepoint programs for process tracking
  *
- * Attaches tracepoint programs for monitoring connect() syscalls
- * to correlate network traffic with processes.
+ * Attaches tracepoint programs for monitoring:
+ * - P-01: connect() syscalls for connection tracking
+ * - P-02: socket/send/recv syscalls for network I/O monitoring
  */
 bool EbpfLoader::attach_tracepoints() {
     struct bpf_program *prog;
 
-    // Attach sys_enter_connect tracepoint
+    // Attach sys_enter_connect tracepoint (P-01)
     prog = bpf_object__find_program_by_name(obj_, "trace_connect");
     if (prog) {
         struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_connect");
@@ -342,7 +343,7 @@ bool EbpfLoader::attach_tracepoints() {
         LOG_WARN("ebpf", "trace_connect program not found in BPF object");
     }
 
-    // Attach sys_exit_connect tracepoint
+    // Attach sys_exit_connect tracepoint (P-01)
     prog = bpf_object__find_program_by_name(obj_, "trace_connect_ret");
     if (prog) {
         struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_exit_connect");
@@ -356,6 +357,102 @@ bool EbpfLoader::attach_tracepoints() {
         }
     } else {
         LOG_WARN("ebpf", "trace_connect_ret program not found in BPF object");
+    }
+
+    // Attach sys_enter_socket tracepoint (P-02)
+    prog = bpf_object__find_program_by_name(obj_, "trace_socket");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_socket");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_socket: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_socket tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_socket program not found in BPF object");
+    }
+
+    // Attach sys_enter_send tracepoint (P-02)
+    prog = bpf_object__find_program_by_name(obj_, "trace_send");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_send");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_send: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_send tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_send program not found in BPF object");
+    }
+
+    // Attach sys_enter_recv tracepoint (P-02)
+    prog = bpf_object__find_program_by_name(obj_, "trace_recv");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_recv");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_recv: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_recv tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_recv program not found in BPF object");
+    }
+
+    // Attach ssl_write tracepoint (P-04: TLS connection process attribution)
+    prog = bpf_object__find_program_by_name(obj_, "trace_ssl_write");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "ssl", "ssl_write");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_ssl_write: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_ssl_write tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_ssl_write program not found in BPF object");
+    }
+
+    // Attach ssl_read tracepoint (P-04: TLS connection process attribution)
+    prog = bpf_object__find_program_by_name(obj_, "trace_ssl_read");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "ssl", "ssl_read");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_ssl_read: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_ssl_read tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_ssl_read program not found in BPF object");
+    }
+
+    // Attach sys_enter_getaddrinfo tracepoint (P-05: DNS query process attribution)
+    prog = bpf_object__find_program_by_name(obj_, "trace_getaddrinfo");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_getaddrinfo");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_getaddrinfo: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_getaddrinfo tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_getaddrinfo program not found in BPF object");
     }
 
     return !tracepoint_links_.empty();

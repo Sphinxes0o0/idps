@@ -93,6 +93,18 @@ public:
     void stop();
 
     /*
+     * 批量获取并处理事件
+     * @param timeout_ms 超时时间 (毫秒)
+     * @return 处理的事件数量，负数表示错误
+     */
+    int poll_events(int timeout_ms);
+
+    /*
+     * 处理单个 ringbuf 事件
+     */
+    void process_event(struct ring_buffer_event *event);
+
+    /*
      * 检查是否正在运行
      */
     bool is_running() const { return running_.load(); }

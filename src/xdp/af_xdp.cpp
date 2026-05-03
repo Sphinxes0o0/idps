@@ -234,6 +234,206 @@ std::string XdpProcessor::get_unavailable_reason() {
     }
 }
 
+/*
+ * O-04: Multi-core Load Balancing - Flow Hash Function
+ *
+ * Computes a 32-bit hash from the 5-tuple using a Jenkins-style hash.
+ * This provides good distribution of flows across queues for RSS-style
+ * load balancing.
+ */
+uint32_t XdpProcessor::flow_hash(uint32_t src_ip, uint32_t dst_ip,
+                                 uint16_t src_port, uint16_t dst_port,
+                                 uint8_t protocol) {
+    uint32_t hash = 0;
+
+    // Mix src_ip
+    hash = src_ip ^ (0x85ebca6b + (hash << 6) + (hash >> 2));
+    hash = (hash << 16) | (hash >> 16);
+    hash = hash * 0x85ebca6b;
+
+    // Mix dst_ip
+    hash = dst_ip ^ (0xc2b2ae35 + (hash << 6) + (hash >> 2));
+    hash = (hash << 16) | (hash >> 16);
+    hash = hash * 0xc2b2ae35;
+
+    // Mix src_port
+    hash = src_port ^ (0x85ebca6b + (hash << 6) + (hash >> 2));
+    hash = (hash << 16) | (hash >> 16);
+    hash = hash * 0x85ebca6b;
+
+    // Mix dst_port
+    hash = dst_port ^ (0xc2b2ae35 + (hash << 6) + (hash >> 2));
+    hash = (hash << 16) | (hash >> 16);
+    hash = hash * 0xc2b2ae35;
+
+    // Mix protocol
+    hash = protocol ^ (0x85ebca6b + (hash << 6) + (hash >> 2));
+    hash = (hash << 16) | (hash >> 16);
+    hash = hash * 0x85ebca6b;
+    hash = hash ^ (hash >> 13);
+    hash = hash * 0xc2b2ae35;
+    hash = hash ^ (hash >> 15);
+
+    return hash;
+}
+
+/*
+ * O-04: Multi-queue Setup for RSS-based Load Balancing
+ *
+ * Creates multiple AF_XDP sockets, one per queue, all sharing the same UMEM.
+ * Each socket is bound to a different queue, allowing the kernel to distribute
+ * flows across queues using RSS hashing.
+ */
+bool XdpProcessor::setup_multiqueue(int ifindex, uint32_t base_queue, uint32_t num_queues) {
+    num_queues_ = num_queues;
+
+    // Resize vectors to hold per-queue data
+    sock_fds_.resize(num_queues_);
+    fill_rings_.resize(num_queues_);
+    completion_rings_.resize(num_queues_);
+    ring_offsets_vec_.resize(num_queues_);
+    queue_stats_.resize(num_queues_);
+
+    // Initialize queue stats
+    for (uint32_t i = 0; i < num_queues_; i++) {
+        queue_stats_[i].packets_processed = 0;
+        queue_stats_[i].bytes_processed = 0;
+        queue_stats_[i].drops = 0;
+    }
+
+    // Calculate UMEM size for all queues (shared)
+    uint64_t total_umem_size = num_frames_ * frame_size_;
+
+    // Create UMEM once and share across sockets
+    struct xdp_umem_reg mr = {};
+    mr.addr = 0;  // Let kernel allocate
+    mr.len = total_umem_size;
+    mr.chunk_size = frame_size_;
+    mr.headroom = 0;
+    mr.flags = XDP_UMEM_UNALIGNED_CHUNK_FLAG;
+
+    // mmap UMEM area (shared)
+    umem_area_ = static_cast<uint8_t*>(mmap(nullptr, total_umem_size,
+                                              PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (umem_area_ == MAP_FAILED) {
+        LOG_ERR("xdp", "failed to mmap shared UMEM: %s", strerror(errno));
+        return false;
+    }
+
+    // Create sockets for each queue
+    for (uint32_t q = 0; q < num_queues_; q++) {
+        // Create AF_XDP socket
+        sock_fds_[q] = socket(AF_XDP, SOCK_RAW, 0);
+        if (sock_fds_[q] < 0) {
+            LOG_ERR("xdp", "failed to create socket for queue %u: %s", q, strerror(errno));
+            for (uint32_t j = 0; j < q; j++) {
+                ::close(sock_fds_[j]);
+            }
+            sock_fds_.clear();
+            return false;
+        }
+
+        // Register UMEM with this socket
+        if (setsockopt(sock_fds_[q], SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr)) < 0) {
+            LOG_ERR("xdp", "failed to register UMEM for queue %u: %s", q, strerror(errno));
+            for (uint32_t j = 0; j <= q; j++) {
+                ::close(sock_fds_[j]);
+            }
+            sock_fds_.clear();
+            return false;
+        }
+
+        // Bind socket to queue
+        struct sockaddr_xdp addr = {};
+        addr.sxdp_family = AF_XDP;
+        addr.sxdp_ifindex = ifindex;
+        addr.sxdp_queue_id = base_queue + q;
+        addr.sxdp_flags = XDP_SHARED_UMEM;  // Share UMEM with other sockets
+
+        if (bind(sock_fds_[q], (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            LOG_ERR("xdp", "failed to bind socket to queue %u: %s", base_queue + q, strerror(errno));
+            for (uint32_t j = 0; j <= q; j++) {
+                ::close(sock_fds_[j]);
+            }
+            sock_fds_.clear();
+            return false;
+        }
+
+        // Get mmap offsets for this socket
+        struct xdp_mmap_offsets off = {};
+        socklen_t optlen = sizeof(off);
+        if (getsockopt(sock_fds_[q], SOL_XDP, XDP_MMAP_OFFSETS, &off, &optlen) < 0) {
+            LOG_ERR("xdp", "failed to get mmap offsets for queue %u: %s", q, strerror(errno));
+            for (uint32_t j = 0; j <= q; j++) {
+                ::close(sock_fds_[j]);
+            }
+            sock_fds_.clear();
+            return false;
+        }
+
+        ring_offsets_vec_[q].fill.producer = off.fr.producer;
+        ring_offsets_vec_[q].fill.consumer = off.fr.consumer;
+        ring_offsets_vec_[q].fill.desc = off.fr.desc;
+        ring_offsets_vec_[q].fill.flags = off.fr.flags;
+        ring_offsets_vec_[q].completion.producer = off.cr.producer;
+        ring_offsets_vec_[q].completion.consumer = off.cr.consumer;
+        ring_offsets_vec_[q].completion.desc = off.cr.desc;
+        ring_offsets_vec_[q].completion.flags = off.cr.flags;
+
+        // mmap fill ring for this queue
+        fill_rings_[q] = static_cast<struct xdp_desc*>(
+            mmap(nullptr, num_frames_ * sizeof(struct xdp_desc),
+                 PROT_READ | PROT_WRITE, MAP_SHARED, sock_fds_[q],
+                 XDP_UMEM_PGOFF_FILL_RING));
+        if (fill_rings_[q] == MAP_FAILED) {
+            LOG_ERR("xdp", "failed to mmap fill ring for queue %u: %s", q, strerror(errno));
+            for (uint32_t j = 0; j <= q; j++) {
+                ::close(sock_fds_[j]);
+            }
+            sock_fds_.clear();
+            return false;
+        }
+
+        // mmap completion ring for this queue
+        completion_rings_[q] = static_cast<struct xdp_desc*>(
+            mmap(nullptr, num_frames_ * sizeof(struct xdp_desc),
+                 PROT_READ | PROT_WRITE, MAP_SHARED, sock_fds_[q],
+                 XDP_UMEM_PGOFF_COMPLETION_RING));
+        if (completion_rings_[q] == MAP_FAILED) {
+            LOG_ERR("xdp", "failed to mmap completion ring for queue %u: %s", q, strerror(errno));
+            for (uint32_t j = 0; j <= q; j++) {
+                ::close(sock_fds_[j]);
+            }
+            sock_fds_.clear();
+            return false;
+        }
+
+        // Pre-fill the fill ring with frame addresses
+        for (uint32_t i = 0; i < num_frames_; i++) {
+            fill_rings_[q][i].addr = reinterpret_cast<uint64_t>(umem_area_ + i * frame_size_);
+            fill_rings_[q][i].len = frame_size_;
+            fill_rings_[q][i].options = 0;
+        }
+
+        // Set socket to non-blocking
+        int sock_flags = fcntl(sock_fds_[q], F_GETFL, 0);
+        fcntl(sock_fds_[q], F_SETFL, sock_flags | O_NONBLOCK);
+
+        LOG_INFO("xdp", "setup queue %u (socket fd=%d)", q, sock_fds_[q]);
+    }
+
+    // Use first socket as primary for single-queue style operations
+    sock_fd_ = sock_fds_[0];
+    fill_ring_ = fill_rings_[0];
+    completion_ring_ = completion_rings_[0];
+    ring_offsets_ = ring_offsets_vec_[0];
+
+    LOG_INFO("xdp", "multi-queue setup complete: %u queues, %u frames total",
+             num_queues_, num_frames_);
+    return true;
+}
+
 bool XdpProcessor::open(const XdpConfig& config) {
     if (opened_) {
         LOG_WARN("xdp", "already opened");
@@ -244,18 +444,32 @@ bool XdpProcessor::open(const XdpConfig& config) {
     frame_size_ = config.frame_size;
     umem_size_ = num_frames_ * frame_size_;
 
-    // 创建 AF_XDP socket
-    sock_fd_ = socket(AF_XDP, SOCK_RAW, 0);
-    if (sock_fd_ < 0) {
-        LOG_ERR("xdp", "failed to create socket: %s", strerror(errno));
-        return false;
-    }
-
     // 获取接口索引
     int ifindex = if_nametoindex(config.iface.c_str());
     if (ifindex == 0) {
         LOG_ERR("xdp", "failed to get ifindex for %s", config.iface.c_str());
         close();
+        return false;
+    }
+
+    // O-04: Multi-queue mode if num_queues > 1
+    if (config.num_queues > 1) {
+        if (!setup_multiqueue(ifindex, config.queue_id, config.num_queues)) {
+            close();
+            return false;
+        }
+        opened_ = true;
+        LOG_INFO("xdp", "opened AF_XDP multi-queue on %s queues %u-%u (%u frames @ %u bytes)",
+                 config.iface.c_str(), config.queue_id, config.queue_id + config.num_queues - 1,
+                 num_frames_, frame_size_);
+        return true;
+    }
+
+    // Single queue mode (original behavior)
+    // 创建 AF_XDP socket
+    sock_fd_ = socket(AF_XDP, SOCK_RAW, 0);
+    if (sock_fd_ < 0) {
+        LOG_ERR("xdp", "failed to create socket: %s", strerror(errno));
         return false;
     }
 
@@ -357,22 +571,49 @@ void XdpProcessor::close() {
         stop();
     }
 
-    if (fill_ring_ != nullptr && fill_ring_ != MAP_FAILED) {
-        munmap(fill_ring_, num_frames_ * sizeof(struct xdp_desc));
-        fill_ring_ = nullptr;
+    // O-04: Multi-queue cleanup
+    if (num_queues_ > 1 && !sock_fds_.empty()) {
+        // Clean up per-queue rings
+        for (uint32_t q = 0; q < num_queues_; q++) {
+            if (q < fill_rings_.size() && fill_rings_[q] != nullptr && fill_rings_[q] != MAP_FAILED) {
+                munmap(fill_rings_[q], num_frames_ * sizeof(struct xdp_desc));
+                fill_rings_[q] = nullptr;
+            }
+            if (q < completion_rings_.size() && completion_rings_[q] != nullptr && completion_rings_[q] != MAP_FAILED) {
+                munmap(completion_rings_[q], num_frames_ * sizeof(struct xdp_desc));
+                completion_rings_[q] = nullptr;
+            }
+            if (q < sock_fds_.size() && sock_fds_[q] >= 0) {
+                ::close(sock_fds_[q]);
+                sock_fds_[q] = -1;
+            }
+        }
+        sock_fds_.clear();
+        fill_rings_.clear();
+        completion_rings_.clear();
+        ring_offsets_vec_.clear();
+        queue_stats_.clear();
+        num_queues_ = 1;
+    } else {
+        // Single queue cleanup (original behavior)
+        if (fill_ring_ != nullptr && fill_ring_ != MAP_FAILED) {
+            munmap(fill_ring_, num_frames_ * sizeof(struct xdp_desc));
+            fill_ring_ = nullptr;
+        }
+        if (completion_ring_ != nullptr && completion_ring_ != MAP_FAILED) {
+            munmap(completion_ring_, num_frames_ * sizeof(struct xdp_desc));
+            completion_ring_ = nullptr;
+        }
+        if (sock_fd_ >= 0) {
+            ::close(sock_fd_);
+            sock_fd_ = -1;
+        }
     }
-    if (completion_ring_ != nullptr && completion_ring_ != MAP_FAILED) {
-        munmap(completion_ring_, num_frames_ * sizeof(struct xdp_desc));
-        completion_ring_ = nullptr;
-    }
+
+    // Shared UMEM cleanup (only in multi-queue mode, UMEM was allocated separately)
     if (umem_area_ != nullptr && umem_area_ != MAP_FAILED) {
         munmap(umem_area_, umem_size_);
         umem_area_ = nullptr;
-    }
-
-    if (sock_fd_ >= 0) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
     }
 
     opened_ = false;
@@ -537,6 +778,11 @@ void XdpProcessor::process_packets() {
             detect_websocket(pkt, pkt.data, pkt.len);
         }
 
+        // N-05: SSH brute force detection (TCP port 22)
+        if (pkt.protocol == IPPROTO_TCP && (pkt.dst_port == 22 || pkt.src_port == 22) && pkt.len > 0) {
+            detect_ssh_bruteforce(pkt, pkt.data, pkt.len);
+        }
+
         // F-19: FTP data connection tracking
         if ((pkt.dst_port == 21 || pkt.src_port == 21) && pkt.len > 0) {
             detect_ftp_data_connection(pkt, pkt.data, pkt.len);
@@ -557,6 +803,22 @@ void XdpProcessor::process_packets() {
                 /* QUIC traffic detected on port 443 */
                 LOG_DEBUG("xdp", "QUIC detected: version=0x%x cid=%s", quic_info.version, quic_info.connection_id.c_str());
             }
+        }
+
+        // R-05: MQTT protocol analysis (TCP ports 1883, 8883)
+        if (pkt.protocol == IPPROTO_TCP && (pkt.dst_port == 1883 || pkt.dst_port == 8883 ||
+                                             pkt.src_port == 1883 || pkt.src_port == 8883) && pkt.len > 0) {
+            MqttInfo mqtt_info = {};
+            if (parse_mqtt(pkt.data, pkt.len, mqtt_info)) {
+                /* MQTT traffic detected */
+                LOG_DEBUG("xdp", "MQTT detected: type=%u client_id=%s topic=%s",
+                         mqtt_info.type, mqtt_info.client_id.c_str(), mqtt_info.topic.c_str());
+            }
+        }
+
+        // R-02: HTTP/2 multiplexed stream analysis (TCP ports 80, 443, 8080)
+        if (pkt.protocol == IPPROTO_TCP && pkt.len > 0) {
+            detect_http2(pkt, pkt.data, pkt.len);
         }
 
         // C-04: Service mesh traffic monitoring (iptables vs eBPF path analysis)
@@ -1524,6 +1786,88 @@ void XdpProcessor::detect_http_pipeline(const XdpPacket& pkt, const uint8_t* pay
 }
 
 /*
+ * R-03: WebSocket Frame Parsing
+ *
+ * Parses WebSocket frame header according to RFC 6455.
+ * Returns frame metadata including FIN, opcode, masked bit, and payload length.
+ * Handles extended payload length (126 = 16-bit, 127 = 64-bit).
+ *
+ * WebSocket frame format:
+ * - Byte 0: FIN(1) + opcode(4) + RSV(3)
+ * - Byte 1: MASK(1) + payload_len(7)
+ * - Extended length (if payload_len == 126 or 127)
+ * - Masking key (if MASK bit set, 4 bytes)
+ * - Payload data
+ */
+bool XdpProcessor::parse_websocket_frame(const uint8_t* data, size_t len, WebSocketFrame& frame) {
+    // Initialize output
+    frame = WebSocketFrame{};
+    frame.header_len = 0;
+
+    // WebSocket frame requires at least 2 bytes header
+    if (len < 2) {
+        return false;
+    }
+
+    // Parse byte 0: FIN bit (bit 7), opcode (bits 3-0)
+    frame.fin = (data[0] & 0x80) != 0;
+    frame.opcode = data[0] & 0x0F;
+
+    // Parse byte 1: MASK bit (bit 7), payload length (bits 6-0)
+    frame.masked = (data[1] & 0x80) != 0;
+    uint64_t payload_len_field = data[1] & 0x7F;
+
+    // Calculate base header length
+    size_t header_len = 2;
+
+    // Handle extended payload length
+    if (payload_len_field == 126) {
+        // 16-bit extended length
+        if (len < 4) {
+            return false;  // Need 4 bytes for 16-bit extended length
+        }
+        frame.payload_len = (static_cast<uint16_t>(data[2]) << 8) | data[3];
+        header_len = 4;
+    } else if (payload_len_field == 127) {
+        // 64-bit extended length
+        if (len < 10) {
+            return false;  // Need 10 bytes for 64-bit extended length
+        }
+        // Read 64-bit length (only handle 32-bit values for sanity)
+        frame.payload_len = (static_cast<uint64_t>(data[2]) << 56) |
+                            (static_cast<uint64_t>(data[3]) << 48) |
+                            (static_cast<uint64_t>(data[4]) << 40) |
+                            (static_cast<uint64_t>(data[5]) << 32) |
+                            (static_cast<uint64_t>(data[6]) << 24) |
+                            (static_cast<uint64_t>(data[7]) << 16) |
+                            (static_cast<uint64_t>(data[8]) << 8) |
+                            static_cast<uint64_t>(data[9]);
+        header_len = 10;
+    } else {
+        frame.payload_len = payload_len_field;
+    }
+
+    // Add masking key length if present
+    if (frame.masked) {
+        header_len += 4;  // Masking key is always 4 bytes
+    }
+
+    frame.header_len = header_len;
+
+    // Validate we have enough data for the header
+    if (len < header_len) {
+        return false;
+    }
+
+    // Validate payload length is reasonable (reject unreasonable frames)
+    if (frame.payload_len > 16777216) {  // 16MB limit
+        return false;
+    }
+
+    return true;
+}
+
+/*
  * F-23: WebSocket Frame Detection
  *
  * Parses WebSocket frame headers to detect fragmented/mixed frames.
@@ -1761,6 +2105,150 @@ void XdpProcessor::detect_websocket(const XdpPacket& pkt, const uint8_t* payload
 
     // Update last opcode
     data.last_opcode = opcode;
+}
+
+/*
+ * N-05: SSH Brute Force Detection
+ *
+ * Detects SSH brute force attacks by tracking authentication failure messages.
+ * SSH servers send various failure messages including:
+ * - "Permission denied"
+ * - "Invalid password"
+ * - "Authentication failed"
+ * - "Connection refused"
+ *
+ * We track failures per (source_ip, target_ip) pair and alert when threshold is exceeded.
+ */
+void XdpProcessor::detect_ssh_bruteforce(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len) {
+    // Only track SSH traffic (port 22)
+    if (pkt.protocol != IPPROTO_TCP) {
+        return;
+    }
+
+    if (payload_len == 0) {
+        return;
+    }
+
+    // Get current timestamp in ms
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    // Clean up old entries (timeout-based eviction)
+    for (auto it = ssh_brute_force_.begin(); it != ssh_brute_force_.end(); ) {
+        if (now_ms - (it->second.last_failure / 1000) > SSH_BRUTE_FORCE_TIMEOUT_MS) {
+            it = ssh_brute_force_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // SSH failure strings to detect
+    static const char* ssh_failed_strings[] = {
+        "Permission denied",
+        "Invalid password",
+        "Authentication failed",
+        "Connection refused",
+        "No route to host",
+        "Host key verification failed",
+        "Too many authentication failures"
+    };
+
+    // Simple portable substring search (replaces GNU-specific memmem)
+    auto find_in_payload = [&payload, payload_len](const char* msg) -> bool {
+        size_t msg_len = std::strlen(msg);
+        if (payload_len < msg_len) {
+            return false;
+        }
+        // Slide window over payload
+        for (size_t i = 0; i <= payload_len - msg_len; i++) {
+            bool match = true;
+            for (size_t j = 0; j < msg_len && match; j++) {
+                if (payload[i + j] != static_cast<uint8_t>(msg[j])) {
+                    match = false;
+                }
+            }
+            if (match) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool found_failure = false;
+    for (const auto& msg : ssh_failed_strings) {
+        if (find_in_payload(msg)) {
+            found_failure = true;
+            break;
+        }
+    }
+
+    if (!found_failure) {
+        return;  // No SSH failure message detected
+    }
+
+    // Build key for this (source_ip, target_ip) pair
+    // The source is the potential attacker, destination is the SSH server
+    SshBruteForceKey key = {
+        .src_ip = pkt.src_ip,
+        .dst_ip = pkt.dst_ip
+    };
+
+    auto it = ssh_brute_force_.find(key);
+    if (it == ssh_brute_force_.end()) {
+        // First failure from this source to this target
+        SshBruteForceData data = {
+            .fail_count = 1,
+            .window_start = now_ms,
+            .last_failure = now_ms,
+            .alert_sent = false
+        };
+        ssh_brute_force_[key] = data;
+        return;
+    }
+
+    // Update existing entry
+    SshBruteForceData& data = it->second;
+    data.last_failure = now_ms;
+
+    // Check if we're still within the detection window
+    if (now_ms - data.window_start > SSH_BRUTE_FORCE_WINDOW_MS) {
+        // Reset window
+        data.window_start = now_ms;
+        data.fail_count = 1;
+        data.alert_sent = false;
+        return;
+    }
+
+    // Increment failure count
+    data.fail_count++;
+
+    // Check if threshold exceeded
+    if (data.fail_count >= SSH_BRUTE_FORCE_THRESHOLD && !data.alert_sent) {
+        // Generate alert
+        DpiResult result;
+        result.matched = true;
+        result.rule_id = -1;  // Internal rule
+        result.message = "SSH brute force detected: " +
+            std::to_string(data.fail_count) + " failures from " +
+            std::to_string((pkt.src_ip >> 24) & 0xFF) + "." +
+            std::to_string((pkt.src_ip >> 16) & 0xFF) + "." +
+            std::to_string((pkt.src_ip >> 8) & 0xFF) + "." +
+            std::to_string(pkt.src_ip & 0xFF) + " to SSH server";
+
+        dpi_match_count_++;
+        if (dpi_callback_) {
+            dpi_callback_(pkt, result);
+        }
+        data.alert_sent = true;
+
+        LOG_WARN("xdp", "SSH brute force detected: %u failures from %u.%u.%u.%u to SSH server %u.%u.%u.%u:%u",
+                 data.fail_count,
+                 (pkt.src_ip >> 24) & 0xFF, (pkt.src_ip >> 16) & 0xFF,
+                 (pkt.src_ip >> 8) & 0xFF, pkt.src_ip & 0xFF,
+                 (pkt.dst_ip >> 24) & 0xFF, (pkt.dst_ip >> 16) & 0xFF,
+                 (pkt.dst_ip >> 8) & 0xFF, pkt.dst_ip & 0xFF,
+                 pkt.dst_port);
+    }
 }
 
 /*
@@ -2043,8 +2531,345 @@ bool XdpProcessor::parse_dns_query(const uint8_t* payload, size_t payload_len, D
     info.query_type = (ptr[0] << 8) | ptr[1];
     info.query_name = query_name;
 
+    // N-03: DNS Tunneling Detection - check for suspicious patterns
+    // Long domain name (>50 bytes) - may indicate encoded data exfiltration
+    if (info.query_name.length() > 50) {
+        info.is_tunneling = true;
+    }
+
+    // Excessive labels (>20 dots) - may indicate obfuscation or tunneling
+    size_t label_count = std::count(info.query_name.begin(), info.query_name.end(), '.');
+    if (label_count > 20) {
+        info.is_tunneling = true;
+    }
+
+    // Abnormal query types often used in DNS tunneling:
+    // TXT (16), NULL (10), AXFR (252)
+    if (info.query_type == 16 || info.query_type == 10 || info.query_type == 252) {
+        info.is_tunneling = true;
+    }
+
     info.is_valid = !query_name.empty();
     return info.is_valid;
+}
+
+/*
+ * R-02: HTTP/2 Multiplexed Stream Analysis
+ *
+ * Parses HTTP/2 frames to detect and analyze multiplexed streams.
+ * HTTP/2 allows multiple streams to be multiplexed over a single TCP connection.
+ *
+ * HTTP/2 frame format (RFC 7540):
+ * - Length (3 bytes): payload length (up to 16384)
+ * - Type (1 byte): frame type
+ * - Flags (1 byte): frame-specific flags
+ * - Stream ID (4 bytes): stream identifier (bit 1 must be 0)
+ *
+ * Frame types:
+ * - 0x0: DATA - stream data
+ * - 0x1: HEADERS - headers for a stream
+ * - 0x2: PRIORITY - stream priority
+ * - 0x3: RST_STREAM - stream error notification
+ * - 0x4: SETTINGS - connection configuration
+ * - 0x5: PING - round-trip time measurement
+ * - 0x6: WINDOW_UPDATE - flow control
+ * - 0x7: CONTINUATION - header continuation
+ * - 0x8: ALT_SVC - alternative services
+ * - 0x9: ORIGIN - origins for connection
+ */
+bool XdpProcessor::parse_http2_frame(const uint8_t* data, size_t len, Http2FrameInfo& info) {
+    /* HTTP/2 frame header is 9 bytes: length(3) + type(1) + flags(1) + stream_id(4) */
+    if (len < 9) {
+        return false;
+    }
+
+    /* Parse length (3 bytes, big-endian) */
+    info.length = (static_cast<uint32_t>(data[0]) << 16) |
+                  (static_cast<uint32_t>(data[1]) << 8) |
+                  static_cast<uint32_t>(data[2]);
+
+    /* Type (1 byte) */
+    info.type = data[3];
+
+    /* Flags (1 byte) */
+    info.flags = data[4];
+
+    /* Stream ID (4 bytes, big-endian, bits 1-31 used) */
+    info.stream_id = (static_cast<uint32_t>(data[5]) << 24) |
+                     (static_cast<uint32_t>(data[6]) << 16) |
+                     (static_cast<uint32_t>(data[7]) << 8) |
+                     static_cast<uint32_t>(data[8]);
+
+    /* Stream ID must not be 0 for DATA, HEADERS, PRIORITY frames */
+    /* Stream ID 0 is reserved for connection-level frames (SETTINGS, PING) */
+    if (info.type != 0x4 && info.type != 0x5 && info.type != 0x6) {
+        if (info.stream_id == 0) {
+            return false;  /* Invalid stream ID */
+        }
+    }
+
+    /* Check for padded frames (HEADERS, DATA) */
+    info.padded = (info.flags & 0x08) != 0;
+
+    /* Check for priority (HEADERS, PRIORITY) */
+    info.has_priority = (info.flags & 0x20) != 0;
+
+    /* Validate frame length doesn't exceed max (16KB per RFC 7540) */
+    if (info.length > 16384) {
+        return false;
+    }
+
+    /* Calculate total frame size */
+    info.frame_size = 9 + info.length;
+
+    /* Validate we have enough data */
+    if (len < info.frame_size) {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * R-02: HTTP/2 Stream Tracking
+ *
+ * Tracks HTTP/2 streams to detect:
+ * - Excessive concurrent streams
+ * - Stream ID anomalies
+ * - Rapid stream creation/teardown
+ * - Priority inversions
+ */
+void XdpProcessor::detect_http2(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len) {
+    /* Only track HTTP/2 on port 80, 443, 8080 */
+    if (pkt.protocol == IPPROTO_TCP &&
+        pkt.dst_port != 80 && pkt.dst_port != 443 && pkt.dst_port != 8080 &&
+        pkt.src_port != 80 && pkt.src_port != 443 && pkt.src_port != 8080) {
+        return;
+    }
+
+    if (payload_len < 9) {
+        return;  /* Need at least HTTP/2 frame header */
+    }
+
+    /* Get current timestamp */
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    /* Clean up old entries */
+    for (auto it = http2_streams_.begin(); it != http2_streams_.end(); ) {
+        if (now_ms - (it->second.last_seen / 1000) > HTTP2_STREAM_TIMEOUT_MS) {
+            it = http2_streams_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    /* Build key for this connection */
+    Http2ConnectionKey key = {
+        .src_ip = pkt.src_ip,
+        .dst_ip = pkt.dst_ip,
+        .src_port = pkt.src_port,
+        .dst_port = pkt.dst_port
+    };
+
+    /* Look up existing connection state */
+    auto conn_it = http2_connections_.find(key);
+    if (conn_it == http2_connections_.end()) {
+        /* New HTTP/2 connection */
+        Http2ConnectionData conn_data = {
+            .connection_initiated = now_ms,
+            .total_streams = 0,
+            .concurrent_streams = 0,
+            .last_stream_id = 0,
+            .settings_received = false,
+            .goaway_sent = false,
+            .alert_sent = false,
+            .rst_flood_count = 0,
+            .settings_count = 0
+        };
+        http2_connections_[key] = conn_data;
+        conn_it = http2_connections_.find(key);
+    }
+
+    Http2ConnectionData& conn = conn_it->second;
+    conn.last_seen = now_ms;
+
+    /* Parse HTTP/2 frame */
+    Http2FrameInfo frame;
+    if (!parse_http2_frame(payload, payload_len, frame)) {
+        return;  /* Not a valid HTTP/2 frame */
+    }
+
+    /* Process based on frame type */
+    switch (frame.type) {
+        case 0x1: { /* HEADERS - new stream */
+            /* Check for new stream on existing connection without SETTINGS */
+            if (conn.total_streams == 0 && !conn.settings_received) {
+                if (!conn.alert_sent) {
+                    DpiResult result;
+                    result.matched = true;
+                    result.rule_id = -1;
+                    result.message = "HTTP/2 HEADERS without prior SETTINGS frame";
+                    dpi_match_count_++;
+                    if (dpi_callback_) {
+                        dpi_callback_(pkt, result);
+                    }
+                    conn.alert_sent = true;
+                }
+            }
+
+            /* Check for invalid stream ID (should be increasing) */
+            if (frame.stream_id <= conn.last_stream_id && conn.last_stream_id != 0) {
+                if (!conn.alert_sent) {
+                    DpiResult result;
+                    result.matched = true;
+                    result.rule_id = -1;
+                    result.message = "HTTP/2: stream ID not increasing (possible reuse/attack)";
+                    dpi_match_count_++;
+                    if (dpi_callback_) {
+                        dpi_callback_(pkt, result);
+                    }
+                    conn.alert_sent = true;
+                }
+            }
+
+            /* Check concurrent streams limit (RFC 7540 recommends at least 100) */
+            conn.concurrent_streams++;
+            conn.total_streams++;
+            conn.last_stream_id = frame.stream_id;
+
+            if (conn.concurrent_streams > HTTP2_MAX_CONCURRENT_STREAMS) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "HTTP/2: excessive concurrent streams (" +
+                               std::to_string(conn.concurrent_streams) + ")";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+            }
+
+            /* Track new stream */
+            Http2StreamData stream_data = {
+                .stream_id = frame.stream_id,
+                .created = now_ms,
+                .last_seen = now_ms,
+                .headers_sent = true,
+                .data_received = false,
+                .closed = false
+            };
+            http2_streams_[key] = stream_data;  /* Simplified: keyed by connection only */
+            (void)stream_data;
+            break;
+        }
+
+        case 0x0: { /* DATA - stream data */
+            /* Find the stream */
+            auto stream_it = http2_streams_.find(key);
+            if (stream_it != http2_streams_.end()) {
+                stream_it->second.data_received = true;
+                stream_it->second.last_seen = now_ms;
+            }
+
+            /* Check for DATA on closed stream */
+            if (stream_it != http2_streams_.end() && stream_it->second.closed) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "HTTP/2 DATA on closed stream (stream_id=" +
+                               std::to_string(frame.stream_id) + ")";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+            }
+            break;
+        }
+
+        case 0x3: { /* RST_STREAM - stream error */
+            auto stream_it = http2_streams_.find(key);
+            if (stream_it != http2_streams_.end()) {
+                stream_it->second.closed = true;
+                if (conn.concurrent_streams > 0) {
+                    conn.concurrent_streams--;
+                }
+            }
+
+            /* Check for RST_STREAM flood (rapid stream closure) */
+            conn.rst_flood_count++;
+            if (conn.rst_flood_count > HTTP2_RST_FLOOD_THRESHOLD) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "HTTP/2 RST_STREAM flood detected";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+            }
+            break;
+        }
+
+        case 0x4: { /* SETTINGS - connection configuration */
+            conn.settings_received = true;
+
+            /* Check for SETTINGS flood */
+            conn.settings_count++;
+            if (conn.settings_count > HTTP2_SETTINGS_FLOOD_THRESHOLD) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "HTTP/2 SETTINGS flood detected";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+            }
+            break;
+        }
+
+        case 0x6: { /* WINDOW_UPDATE - flow control */
+            /* Large WINDOW_UPDATE could indicate bandwidth exhaustion attack */
+            if (frame.length > 8) {  /* Normal is 4 bytes for window increment */
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "HTTP/2: abnormal WINDOW_UPDATE size";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+            }
+            break;
+        }
+
+        case 0x7: { /* CONTINUATION - header continuation */
+            /* Check for header compression bombs (large CONTINUATION) */
+            if (frame.length > HTTP2_MAX_FRAME_SIZE) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "HTTP/2: excessive CONTINUATION frame (possible compression bomb)";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+            }
+            break;
+        }
+
+        case 0x8: { /* GOAWAY - connection termination */
+            conn.goaway_sent = true;
+            /* Clear all streams for this connection */
+            conn.concurrent_streams = 0;
+            http2_streams_.erase(key);
+            break;
+        }
+
+        default:
+            break;
+    }
 }
 
 /*
@@ -2128,6 +2953,208 @@ bool XdpProcessor::parse_quic_header(const uint8_t* data, size_t len, QuicInfo& 
     }
 
     return info.is_quic;
+}
+
+/*
+ * R-05: MQTT Protocol Analysis
+ *
+ * Parses MQTT packets on ports 1883 (unencrypted) and 8883 (TLS).
+ * Extracts connection info (client_id, username) from CONNECT packets,
+ * topic names from PUBLISH/SUBSCRIBE packets.
+ *
+ * MQTT Fixed Header format:
+ * - Byte 0: message_type(4) + flags(4)
+ * - Bytes 1-4: remaining_length (variable, MSB indicates more bytes)
+ *
+ * CONNECT Packet Variable Header:
+ * - Protocol Name (UTF-8 string)
+ * - Protocol Level (1 byte)
+ * - Connect Flags (1 byte): username(1), password(1), will_retain(1), will_qos(2), will_flag(1), clean_session(1), reserved(1)
+ * - Keep Alive (2 bytes)
+ *
+ * CONNECT Packet Payload:
+ * - Client ID (UTF-8 string)
+ * - Will Topic (if will_flag set)
+ * - Will Message (if will_flag set)
+ * - Username (if username_flag set)
+ * - Password (if password_flag set)
+ *
+ * PUBLISH Packet Variable Header:
+ * - Topic Name (UTF-8 string)
+ * - Packet Identifier (if QoS > 0)
+ *
+ * SUBSCRIBE Packet Variable Header:
+ * - Packet Identifier (2 bytes)
+ *
+ * SUBSCRIBE Packet Payload:
+ * - Topic Filter (UTF-8 string)
+ * - QoS (1 byte)
+ */
+bool XdpProcessor::parse_mqtt(const uint8_t* data, size_t len, MqttInfo& info) {
+    info = MqttInfo{};
+
+    /* Minimum MQTT packet: 2 bytes (fixed header) */
+    if (len < 2) {
+        return false;
+    }
+
+    /* Fixed header: message_type(4) + flags(4) */
+    info.type = (data[0] >> 4) & 0x0F;
+    info.flags = data[0] & 0x0F;
+
+    /* Parse remaining length (variable length, 1-4 bytes) */
+    size_t pos = 1;
+    uint32_t multiplier = 1;
+    uint32_t remaining_len = 0;
+    while (pos < len && pos < 5) {
+        uint8_t byte = data[pos];
+        remaining_len += (byte & 0x7F) * multiplier;
+        multiplier *= 128;
+        pos++;
+        if ((byte & 0x80) == 0) {
+            break;  /* Last byte of remaining length */
+        }
+    }
+
+    /* Validate we have at least the remaining length bytes */
+    if (pos >= len) {
+        return false;
+    }
+
+    const uint8_t* payload = data + pos;
+    size_t payload_len = len - pos;
+
+    /* Parse based on message type */
+    switch (info.type) {
+        case 1: { /* CONNECT - Connection Request */
+            /* Variable header: protocol name, level, flags, keep-alive */
+            if (payload_len < 10) {
+                return true;  /* Valid but no payload to parse */
+            }
+
+            /* Protocol name length (2 bytes) + "MQTT" (4 bytes) = 6 bytes minimum */
+            uint16_t proto_name_len = (payload[0] << 8) | payload[1];
+            if (proto_name_len > payload_len - 2) {
+                return true;  /* Invalid, but still mark as MQTT */
+            }
+
+            /* Protocol Level (byte after protocol name) */
+            uint8_t protocol_level = payload[2 + proto_name_len];
+
+            /* Connect Flags (byte after protocol level) */
+            uint8_t connect_flags = payload[3 + proto_name_len];
+
+            /* Keep Alive (2 bytes after connect flags) */
+            info.keepalive = (payload[4 + proto_name_len] << 8) | payload[5 + proto_name_len];
+
+            /* Payload starts after variable header */
+            size_t var_header_len = 6 + proto_name_len;
+            const uint8_t* client_id_start = payload + var_header_len;
+            size_t client_id_len_rem = payload_len - var_header_len;
+
+            if (client_id_len_rem < 2) {
+                return true;  /* No client ID */
+            }
+
+            /* Client ID (UTF-8 string) */
+            uint16_t client_id_len = (client_id_start[0] << 8) | client_id_start[1];
+            if (client_id_len > 0 && client_id_len <= client_id_len_rem - 2) {
+                info.client_id = std::string(reinterpret_cast<const char*>(client_id_start + 2), client_id_len);
+            }
+
+            /* Parse username if present (connect_flags & 0x80) */
+            if (connect_flags & 0x80) {
+                size_t offset = var_header_len + 2 + client_id_len;
+                if (offset + 2 <= payload_len) {
+                    uint16_t username_len = (payload[offset] << 8) | payload[offset + 1];
+                    offset += 2;
+                    if (username_len > 0 && offset + username_len <= payload_len) {
+                        info.username = std::string(reinterpret_cast<const char*>(payload + offset), username_len);
+                    }
+                }
+            }
+
+            /* Parse password if present (connect_flags & 0x40) */
+            if (connect_flags & 0x40) {
+                size_t offset = var_header_len + 2 + client_id_len;
+                if (connect_flags & 0x80) {
+                    /* Skip username */
+                    if (offset + 2 <= payload_len) {
+                        uint16_t username_len = (payload[offset] << 8) | payload[offset + 1];
+                        offset += 2 + username_len;
+                    }
+                }
+                if (offset + 2 <= payload_len) {
+                    uint16_t password_len = (payload[offset] << 8) | payload[offset + 1];
+                    offset += 2;
+                    if (password_len > 0 && offset + password_len <= payload_len) {
+                        info.password = std::string(reinterpret_cast<const char*>(payload + offset), password_len);
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        case 3: { /* PUBLISH */
+            if (payload_len < 2) {
+                return true;
+            }
+
+            /* Topic name (UTF-8 string) */
+            uint16_t topic_len = (payload[0] << 8) | payload[1];
+            if (topic_len > 0 && topic_len <= payload_len - 2) {
+                info.topic = std::string(reinterpret_cast<const char*>(payload + 2), topic_len);
+            }
+
+            /* Extract QoS from flags (bits 1-2) */
+            info.qos = (info.flags >> 1) & 0x03;
+
+            return true;
+        }
+
+        case 8: { /* SUBSCRIBE */
+            if (payload_len < 3) {
+                return true;  /* Need at least packet ID (2 bytes) + topic filter */
+            }
+
+            /* Packet Identifier (2 bytes) - skip */
+            /* Topic Filter (UTF-8 string) starts at offset 2 */
+            uint16_t topic_len = (payload[2] << 8) | payload[3];
+            if (topic_len > 0 && 4 + topic_len <= payload_len) {
+                info.topic = std::string(reinterpret_cast<const char*>(payload + 4), topic_len);
+            }
+
+            /* QoS byte after topic filter */
+            if (4 + topic_len < payload_len) {
+                info.qos = payload[4 + topic_len] & 0x03;
+            }
+
+            return true;
+        }
+
+        case 9: { /* SUBACK */
+            if (payload_len >= 3) {
+                /* Return code in payload[2] - we could log this */
+                info.qos = payload[2] & 0x03;
+            }
+            return true;
+        }
+
+        case 12: { /* PINGREQ */
+            /* No payload */
+            return true;
+        }
+
+        case 14: { /* DISCONNECT */
+            /* No payload */
+            return true;
+        }
+
+        default:
+            /* For other message types, just indicate MQTT detected */
+            return true;
+    }
 }
 
 /*

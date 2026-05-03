@@ -14,8 +14,17 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_tracing.h>
 #include <linux/ptrace.h>
 #include <linux/ipv6.h>
+
+/* Address family definitions (if not provided by headers) */
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
 
 /*
  * 全局配置 (从用户态更新)
@@ -533,10 +542,14 @@ static __always_inline int check_syn_flood(__u32 src_ip, __u32 dst_ip,
 
     /* 检测阈值 */
     if (track->packet_count >= ddos_threshold) {
-        /* 发送 SYN flood 告警 */
+        /* 查找关联的进程 ID (trace_connect 记录 dst_ip -> pid) */
+        __u32 *pid_ptr = bpf_map_lookup_elem(&syn_flood_src_pid, &dst_ip);
+        __u32 pid = pid_ptr ? *pid_ptr : 0;
+
+        /* 发送 SYN flood 告警 (alert_event.rule_id 字段暂存 pid) */
         send_alert(src_ip, dst_ip, 0, dst_port,
                    IPPROTO_TCP, SEVERITY_HIGH,
-                   0, EVENT_SYN_FLOOD);
+                   pid, EVENT_SYN_FLOOD);
         increment_stat(STATS_SYN_FLOOD_ALERTS, 1);
         return 1;
     }
@@ -686,6 +699,77 @@ static __always_inline int check_fin_flood(__u32 src_ip, __u32 dst_ip,
                    IPPROTO_TCP, SEVERITY_HIGH,
                    0, EVENT_FIN_FLOOD);
         increment_stat(STATS_FIN_FLOOD_ALERTS, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * HTTP Slow Connection Detection (Slowloris/Slow POST)
+ *
+ * Tracks packet intervals on HTTP connections (ports 80, 8080).
+ * If the time between packets exceeds SLOWLORIS_THRESHOLD_NS (10 seconds),
+ * it indicates a slowloris or slow POST attack where the attacker holds
+ * the connection open by sending data very slowly.
+ *
+ * Returns: 0=normal, 1=slow connection detected
+ */
+static __always_inline int check_slowloris(__u32 src_ip, __u32 dst_ip,
+                                          __u16 src_port, __u16 dst_port,
+                                          __u8 tcp_flags) {
+    __u64 now = bpf_ktime_get_ns();
+
+    /* Create normalized flow key for tracking */
+    struct flow_key f_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .protocol = IPPROTO_TCP,
+    };
+    normalize_flow_key(&f_key);
+
+    /* Look up existing tracking entry */
+    struct slow_http_stats *stats = bpf_map_lookup_elem(&slow_http_track, &f_key);
+
+    if (!stats) {
+        /* New HTTP connection - create entry */
+        struct slow_http_stats new_stats = {
+            .last_packet_time = now,
+            .connection_start = now,
+            .alert_sent = 0,
+        };
+        bpf_map_update_elem(&slow_http_track, &f_key, &new_stats, BPF_ANY);
+        return 0;
+    }
+
+    /* Check for timeout - delete stale entries */
+    if (now - stats->last_packet_time > SLOWLORIS_THRESHOLD_NS * 3) {
+        bpf_map_delete_elem(&slow_http_track, &f_key);
+        struct slow_http_stats new_stats = {
+            .last_packet_time = now,
+            .connection_start = now,
+            .alert_sent = 0,
+        };
+        bpf_map_update_elem(&slow_http_track, &f_key, &new_stats, BPF_ANY);
+        return 0;
+    }
+
+    /* Calculate time since last packet */
+    __u64 time_diff = now - stats->last_packet_time;
+
+    /* Update last packet time */
+    stats->last_packet_time = now;
+
+    /* Check if interval exceeds slowloris threshold */
+    if (time_diff > SLOWLORIS_THRESHOLD_NS && !stats->alert_sent) {
+        /* Slowloris detected - send alert */
+        send_alert(src_ip, dst_ip, src_port, dst_port,
+                   IPPROTO_TCP, SEVERITY_HIGH,
+                   0, EVENT_SLOWLORIS);
+        increment_stat(STATS_SLOWLORIS_ALERTS, 1);
+        stats->alert_sent = 1;
         return 1;
     }
 
@@ -1474,6 +1558,268 @@ static __always_inline int check_telnet(const __u8 *payload, __u32 payload_len) 
     return 0;
 }
 
+/*
+ * R-04: SMTP Command Detection
+ *
+ * SMTP session state tracking:
+ *   CONNECT (220 banner) -> EHLO/HELO -> AUTH/MAIL FROM -> RCPT TO -> DATA
+ *
+ * Detects:
+ *   - SMTP command sequence anomalies
+ *   - Suspicious authentication attempts
+ *   - Potential spam/phishing patterns
+ *
+ * Returns: SMTP state enum value (enum smtp_state)
+ */
+static __always_inline __u8 check_smtp_state(const __u8 *payload, __u32 payload_len,
+                                              __u32 src_ip, __u32 dst_ip,
+                                              __u16 src_port, __u16 dst_port) {
+    if (payload_len < 4) return SMTP_UNKNOWN;
+
+    /* Build SMTP tracking key */
+    struct smtp_track_key s_key = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .src_port = src_port,
+        .dst_port = dst_port,
+    };
+
+    /* Look up existing SMTP session state */
+    struct smtp_track_value *s_val = bpf_map_lookup_elem(&smtp_track, &s_key);
+    __u64 now = bpf_ktime_get_ns();
+
+    /* Current state (default to CONNECT for new sessions) */
+    __u8 current_state = SMTP_CONNECT;
+    __u32 cmd_count = 0;
+
+    if (s_val) {
+        current_state = s_val->state;
+        cmd_count = s_val->command_count;
+
+        /* Timeout check: reset state after 5 minutes of inactivity */
+        if (now - s_val->last_seen > 300000000000ULL) {
+            current_state = SMTP_CONNECT;
+            cmd_count = 0;
+        }
+    }
+
+    /* Detect SMTP commands - case-insensitive comparison */
+    __u8 p0 = payload[0];
+    __u8 p1 = payload[1];
+    __u8 p2 = payload[2];
+    __u8 p3 = payload[3];
+
+    /* Convert to uppercase for case-insensitive matching */
+    if (p0 >= 'a' && p0 <= 'z') p0 = p0 - 'a' + 'A';
+    if (p1 >= 'a' && p1 <= 'z') p1 = p1 - 'a' + 'A';
+    if (p2 >= 'a' && p2 <= 'z') p2 = p2 - 'a' + 'A';
+    if (p3 >= 'a' && p3 <= 'z') p3 = p3 - 'a' + 'A';
+
+    __u8 new_state = current_state;
+    int is_smtp_cmd = 0;
+
+    /* Check for 220 banner (server greeting) - server -> client */
+    if (payload_len >= 3 && p0 == '2' && p1 == '2' && p2 == '0') {
+        new_state = SMTP_CONNECT;
+        is_smtp_cmd = 1;
+    }
+    /* EHLO command (Extended HELLO) */
+    else if (payload_len >= 4 && p0 == 'E' && p1 == 'H' && p2 == 'L' && p3 == 'O') {
+        new_state = SMTP_EHLO;
+        is_smtp_cmd = 1;
+    }
+    /* HELO command (HELLO) */
+    else if (payload_len >= 4 && p0 == 'H' && p1 == 'E' && p2 == 'L' && p3 == 'O') {
+        new_state = SMTP_EHLO;
+        is_smtp_cmd = 1;
+    }
+    /* AUTH command */
+    else if (payload_len >= 4 && p0 == 'A' && p1 == 'U' && p2 == 'T' && p3 == 'H') {
+        new_state = SMTP_AUTH;
+        is_smtp_cmd = 1;
+    }
+    /* MAIL FROM command */
+    else if (payload_len >= 5) {
+        __u8 p4 = payload[4];
+        if (p4 >= 'a' && p4 <= 'z') p4 = p4 - 'a' + 'A';
+        if (p0 == 'M' && p1 == 'A' && p2 == 'I' && p3 == 'L' && p4 == ' ') {
+            new_state = SMTP_AUTH;
+            is_smtp_cmd = 1;
+        }
+    }
+    /* RCPT TO command */
+    else if (payload_len >= 5) {
+        __u8 p4 = payload[4];
+        if (p4 >= 'a' && p4 <= 'z') p4 = p4 - 'a' + 'A';
+        if (p0 == 'R' && p1 == 'C' && p2 == 'P' && p3 == 'T' && p4 == ' ') {
+            /* RCPT TO after MAIL FROM is valid */
+            if (current_state >= SMTP_AUTH) {
+                new_state = SMTP_DATA;
+                is_smtp_cmd = 1;
+            }
+        }
+    }
+    /* DATA command */
+    else if (payload_len >= 4 && p0 == 'D' && p1 == 'A' && p2 == 'T' && p3 == 'A') {
+        new_state = SMTP_DATA;
+        is_smtp_cmd = 1;
+    }
+    /* RSET command */
+    else if (payload_len >= 4 && p0 == 'R' && p1 == 'S' && p2 == 'E' && p3 == 'T') {
+        new_state = SMTP_EHLO;
+        is_smtp_cmd = 1;
+    }
+    /* NOOP command */
+    else if (payload_len >= 4 && p0 == 'N' && p1 == 'O' && p2 == 'O' && p3 == 'P') {
+        is_smtp_cmd = 1;
+    }
+    /* QUIT command */
+    else if (payload_len >= 4 && p0 == 'Q' && p1 == 'U' && p2 == 'I' && p3 == 'T') {
+        new_state = SMTP_CONNECT;
+        cmd_count = 0;
+        is_smtp_cmd = 1;
+    }
+
+    /* Detect anomalous state transitions */
+    if (is_smtp_cmd) {
+        cmd_count++;
+
+        /* Update or create SMTP tracking entry */
+        struct smtp_track_value new_val = {
+            .state = new_state,
+            .padding = {0},
+            .last_seen = now,
+            .command_count = cmd_count,
+        };
+        bpf_map_update_elem(&smtp_track, &s_key, &new_val, BPF_ANY);
+
+        /* Send alert for suspicious patterns */
+        /* AUTH without prior EHLO/HELO - potential reconnaissance */
+        if (new_state == SMTP_AUTH && current_state == SMTP_CONNECT) {
+            send_alert(src_ip, dst_ip, src_port, dst_port,
+                       IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_SMTP_CMD);
+            increment_stat(STATS_SMTP_CMD, 1);
+        }
+        /* DATA before MAIL FROM - anomalous sequence */
+        else if (new_state == SMTP_DATA && current_state < SMTP_AUTH) {
+            send_alert(src_ip, dst_ip, src_port, dst_port,
+                       IPPROTO_TCP, SEVERITY_MEDIUM, 0, EVENT_SMTP_CMD);
+            increment_stat(STATS_SMTP_CMD, 1);
+        }
+        /* High command count - potential brute force or spam */
+        else if (cmd_count > 50) {
+            send_alert(src_ip, dst_ip, src_port, dst_port,
+                       IPPROTO_TCP, SEVERITY_MEDIUM, 0, EVENT_SMTP_CMD);
+            increment_stat(STATS_SMTP_CMD, 1);
+        }
+    }
+
+    return new_state;
+}
+
+/*
+ * O-02: BPF Map Lookup Cache - Stack caching for frequently accessed map data
+ * Reduces redundant BPF map lookups within the same packet processing
+ */
+struct map_cache {
+    struct config_entry *cfg;
+    struct flow_stats *flow_stats;
+    int flow_found;
+    __u64 config_cache_time;
+};
+
+static __always_inline void init_map_cache(struct map_cache *cache) {
+    cache->cfg = NULL;
+    cache->flow_stats = NULL;
+    cache->flow_found = 0;
+    cache->config_cache_time = 0;
+}
+
+static __always_inline struct config_entry *get_cached_config(struct map_cache *cache) {
+    __u64 now = bpf_ktime_get_ns();
+    if (cache->cfg && (now - cache->config_cache_time) < 1000000000ULL) {
+        return cache->cfg;
+    }
+    __u32 key = 0;
+    cache->cfg = bpf_map_lookup_elem(&config, &key);
+    cache->config_cache_time = now;
+    return cache->cfg;
+}
+
+static __always_inline __u32 get_config_drop_enabled_cached(struct map_cache *cache) {
+    struct config_entry *cfg = get_cached_config(cache);
+    return cfg ? cfg->drop_enabled : 0;
+}
+
+static __always_inline __u32 get_dns_amp_threshold_cached(struct map_cache *cache) {
+    struct config_entry *cfg = get_cached_config(cache);
+    return cfg ? cfg->dns_amp_threshold : 10;
+}
+
+static __always_inline int update_flow_stats_cached(struct flow_key *key,
+                                                  __u32 pkt_len, __u64 now,
+                                                  struct map_cache *cache) {
+    int alert_sent = 0;
+
+    if (cache->flow_found && cache->flow_stats) {
+        cache->flow_stats->packet_count++;
+        cache->flow_stats->byte_count += pkt_len;
+        cache->flow_stats->last_seen = now;
+
+        if (now - cache->flow_stats->window_start >= WINDOW_SIZE_NS) {
+            cache->flow_stats->window_start = now;
+            cache->flow_stats->window_packets = 1;
+        } else {
+            cache->flow_stats->window_packets++;
+        }
+
+        if (cache->flow_stats->window_packets >= ddos_threshold) {
+            send_alert(key->src_ip, key->dst_ip, key->src_port, key->dst_port,
+                      key->protocol, SEVERITY_CRITICAL, 0, EVENT_DDoS_ALERT);
+            increment_stat(STATS_DDoS_ALERTS, 1);
+            alert_sent = 1;
+        }
+        return alert_sent;
+    }
+
+    struct flow_stats *stats = bpf_map_lookup_elem(&conn_track, key);
+    if (!stats) {
+        struct flow_stats new_stats = {
+            .packet_count = 1, .byte_count = pkt_len, .last_seen = now,
+            .window_start = now, .window_packets = 1, .flags = 0,
+        };
+        int ret = bpf_map_update_elem(&conn_track, key, &new_stats, BPF_ANY);
+        if (ret != 0)
+            return 0;
+        cache->flow_stats = bpf_map_lookup_elem(&conn_track, key);
+        cache->flow_found = (cache->flow_stats != NULL);
+        increment_stat(STATS_NEW_FLOWS, 1);
+    } else {
+        stats->packet_count++;
+        stats->byte_count += pkt_len;
+        stats->last_seen = now;
+
+        if (now - stats->window_start >= WINDOW_SIZE_NS) {
+            stats->window_start = now;
+            stats->window_packets = 1;
+        } else {
+            stats->window_packets++;
+        }
+
+        cache->flow_stats = stats;
+        cache->flow_found = 1;
+
+        if (stats->window_packets >= ddos_threshold) {
+            send_alert(key->src_ip, key->dst_ip, key->src_port, key->dst_port,
+                      key->protocol, SEVERITY_CRITICAL, 0, EVENT_DDoS_ALERT);
+            increment_stat(STATS_DDoS_ALERTS, 1);
+            alert_sent = 1;
+        }
+    }
+
+    return alert_sent;
+}
+
 /* XDP 主程序 - 直接处理，不使用 tail call */
 static __always_inline int handle_xdp(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -1484,6 +1830,10 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     __u8 tcp_flags = 0;
     __u64 now = bpf_ktime_get_ns();
     int ret;
+
+    /* O-02: Initialize map lookup cache */
+    struct map_cache cache;
+    init_map_cache(&cache);
 
     /* 检查是否启用 */
     if (!enabled)
@@ -1588,6 +1938,8 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                                                IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_HTTP_DETECTED);
                                     increment_stat(STATS_HTTP_DETECTED, 1);
                                 }
+                                /* Slowloris detection on HTTP ports */
+                                check_slowloris(ipv6_src_ip, ipv6_dst_ip, ipv6_src_port, ipv6_dst_port, ipv6_tcp_flags);
                             }
                             /* SSH detection on port 22 */
                             if (ipv6_dst_port == 22) {
@@ -1613,6 +1965,12 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                                     increment_stat(STATS_TELNET_OPT, 1);
                                 }
                             }
+                            /* SMTP detection on ports 25, 587 */
+                            if (ipv6_dst_port == 25 || ipv6_dst_port == 587) {
+                                check_smtp_state(payload, payload_len,
+                                               ipv6_src_ip, ipv6_dst_ip,
+                                               ipv6_src_port, ipv6_dst_port);
+                            }
                         }
                     }
                 }
@@ -1630,7 +1988,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                                       ipv6_src_port, ipv6_dst_port,
                                       ipv6_protocol, SEVERITY_MEDIUM,
                                       rule_id, EVENT_DPI_REQUEST);
-                        } else if (action == 1 && get_config_drop_enabled()) {
+                        } else if (action == 1 && get_config_drop_enabled_cached(&cache)) {
                             send_alert(ipv6_src_ip, ipv6_dst_ip,
                                       ipv6_src_port, ipv6_dst_port,
                                       ipv6_protocol, SEVERITY_HIGH,
@@ -1657,7 +2015,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
             key.dst_port = ipv6_dst_port;
             key.protocol = ipv6_protocol;
             normalize_flow_key(&key);
-            update_flow_stats(&key, ipv6_pkt_len, now);
+            update_flow_stats_cached(&key, ipv6_pkt_len, now, &cache);
 
             increment_stat(STATS_PACKETS_TOTAL, 1);
             return XDP_PASS;
@@ -1730,6 +2088,8 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                                    IPPROTO_TCP, SEVERITY_LOW, 0, EVENT_HTTP_DETECTED);
                         increment_stat(STATS_HTTP_DETECTED, 1);
                     }
+                    /* Slowloris detection on HTTP ports */
+                    check_slowloris(key.src_ip, key.dst_ip, key.src_port, key.dst_port, tcp_flags);
                 }
                 /* SSH detection on port 22 */
                 if (key.dst_port == 22) {
@@ -1755,6 +2115,12 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                         increment_stat(STATS_TELNET_OPT, 1);
                     }
                 }
+                /* SMTP detection on ports 25, 587 */
+                if (key.dst_port == 25 || key.dst_port == 587) {
+                    check_smtp_state(payload, payload_len,
+                                   key.src_ip, key.dst_ip,
+                                   key.src_port, key.dst_port);
+                }
             }
         }
     }
@@ -1763,7 +2129,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
     normalize_flow_key(&key);
 
     /* 更新流统计并检查 DDoS */
-    int alert_sent = update_flow_stats(&key, pkt_len, bpf_ktime_get_ns());
+    int alert_sent = update_flow_stats_cached(&key, pkt_len, now, &cache);
     if (alert_sent) {
         /* DDoS 告警已发送，但仍然放行让用户态记录 */
         /* 或者可以在这里 XDP_DROP 丢弃 */
@@ -1783,7 +2149,7 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
                           key.src_port, key.dst_port,
                           key.protocol, SEVERITY_MEDIUM,
                           rule_id, EVENT_DPI_REQUEST);
-            } else if (action == 1 && get_config_drop_enabled()) {
+            } else if (action == 1 && get_config_drop_enabled_cached(&cache)) {
                 /* Drop 动作：丢弃数据包并发送告警 */
                 send_alert(key.src_ip, key.dst_ip,
                           key.src_port, key.dst_port,
@@ -1813,6 +2179,112 @@ static __always_inline int handle_xdp(struct xdp_md *ctx) {
 SEC("xdp")
 int nids_xdp(struct xdp_md *ctx) {
     return handle_xdp(ctx);
+}
+
+
+/*
+ * P-05: trace_getaddrinfo - 追踪 DNS 查询 (getaddrinfo/gethostbyname)
+ * 用于将 DNS 查询关联到发起进程的 PID
+ *
+ * getaddrinfo 参数:
+ *   parm1: const char *node (hostname)
+ *   parm2: const char *service
+ *   parm3: const struct addrinfo *hints
+ *   parm4: struct addrinfo **res
+ */
+SEC("tracepoint/syscalls/sys_enter_getaddrinfo")
+int trace_getaddrinfo(struct pt_regs *ctx) {
+    /* 获取当前进程 ID */
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    /* 获取 hostname 参数 (第一个参数) */
+    const char *hostname = (const char *)PT_REGS_PARM1(ctx);
+    if (!hostname)
+        return 0;
+
+    /* 读取 hostname 字符串 (最多 127 字节 + null terminator) */
+    struct dns_query_info info = {
+        .timestamp = bpf_ktime_get_ns(),
+    };
+
+    /* 读取hostname，最多127字节以确保null terminated */
+    char hostname_buf[128];
+    __builtin_memset(hostname_buf, 0, sizeof(hostname_buf));
+    bpf_probe_read(hostname_buf, sizeof(hostname_buf) - 1, hostname);
+
+    /* 复制到 info 结构 (最多 127 字节) */
+    for (int i = 0; i < 127; i++) {
+        info.hostname[i] = hostname_buf[i];
+    }
+    info.hostname[127] = '\0';
+
+    /* 存储到 DNS 查询追踪 map */
+    struct dns_query_key key = {
+        .pid = pid,
+    };
+    bpf_map_update_elem(&dns_query_track, &key, &info, BPF_ANY);
+
+    return 0;
+}
+
+/*
+ * trace_connect - 追踪 TCP connect() 系统调用
+ * 用于 SYN flood 源进程关联
+ *
+ * 当进程调用 connect() 时，记录目标 IP 与进程 ID 的关联。
+ * 在检测到 SYN flood 时，可通过目标 IP 查找对应的进程。
+ */
+SEC("tracepoint/syscalls/sys_enter_connect")
+int trace_connect(struct pt_regs *ctx) {
+    /* 获取当前进程 ID */
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    /* 获取 sockaddr 参数 (第二个参数) */
+    struct sockaddr *addr = (struct sockaddr *)PT_REGS_PARM2(ctx);
+    if (!addr)
+        return 0;
+
+    /* 读取地址族 */
+    __u16 family;
+    if (bpf_probe_read(&family, sizeof(family), (void *)addr) != 0)
+        return 0;
+
+    __u32 dst_ip = 0;
+    __u16 dst_port = 0;
+
+    if (family == AF_INET) {
+        /* IPv4: sockaddr_in (sin_family=0, sin_port=2, sin_addr=4) */
+        struct in_addr *addr4 = (struct in_addr *)((__u8 *)addr + 4);
+        __u32 ip;
+        if (bpf_probe_read(&ip, sizeof(ip), addr4) != 0)
+            return 0;
+        dst_ip = bpf_ntohl(ip);
+
+        __u16 port;
+        if (bpf_probe_read(&port, sizeof(port), (__u8 *)addr + 2) != 0)
+            return 0;
+        dst_port = bpf_ntohs(port);
+
+    } else if (family == AF_INET6) {
+        /* IPv6: sockaddr_in6 (sin6_family=0, sin6_port=2, sin6_addr=8) */
+        __u32 *addr6 = (__u32 *)((__u8 *)addr + 8);
+        __u32 ip;
+        if (bpf_probe_read(&ip, sizeof(ip), addr6) != 0)
+            return 0;
+        dst_ip = bpf_ntohl(ip);
+
+        __u16 port;
+        if (bpf_probe_read(&port, sizeof(port), (__u8 *)addr + 2) != 0)
+            return 0;
+        dst_port = bpf_ntohs(port);
+    } else {
+        return 0;
+    }
+
+    /* 记录目标 IP -> 进程 ID 关联 (用于 SYN flood 溯源) */
+    bpf_map_update_elem(&syn_flood_src_pid, &dst_ip, &pid, BPF_ANY);
+
+    return 0;
 }
 
 /*

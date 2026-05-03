@@ -12,12 +12,15 @@
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 #include <cstdint>
 
 // Forward declarations instead of including libbpf headers
 struct bpf_object;
 struct bpf_program;
 struct bpf_map;
+struct bpf_link;
+struct bpf_tracer_opts;
 
 namespace nids {
 
@@ -150,7 +153,9 @@ public:
 private:
     bool load_bpf_object(const std::string& path);
     bool attach_xdp();
+    bool attach_tracepoints();
     void close_maps();
+    void close_tracepoints();
 
     bpf_object* obj_;
     bpf_program* prog_;
@@ -162,6 +167,9 @@ private:
 
     // Map 缓存
     std::unordered_map<std::string, int> map_fds_;
+
+    // Tracepoint 程序链接 (P-01: 进程感知流量监控)
+    std::vector<bpf_link*> tracepoint_links_;
 };
 
 } // namespace nids

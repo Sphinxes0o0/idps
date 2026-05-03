@@ -59,6 +59,7 @@ EbpfLoader::EbpfLoader()
     , ifindex_(0)
     , loaded_(false)
     , attached_(false) {
+    tracepoint_links_.reserve(4);  // Reserve for trace_connect and trace_connect_ret
 }
 
 EbpfLoader::~EbpfLoader() {
@@ -131,6 +132,12 @@ bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bp
         return false;
     }
 
+    // Attach tracepoint programs (P-01: 进程感知流量监控)
+    if (!attach_tracepoints()) {
+        LOG_WARN("ebpf", "failed to attach tracepoints, continuing without process tracking");
+        // Don't fail the whole load, tracepoints are optional
+    }
+
     loaded_ = true;
     LOG_INFO("ebpf", "loaded and attached to %s", iface.c_str());
     return true;
@@ -138,9 +145,12 @@ bool EbpfLoader::load_and_attach(const std::string& iface, const std::string& bp
 
 void EbpfLoader::detach() {
     if (attached_ && ifindex_ > 0) {
-        bpf_set_link_xdp_fd(ifindex_, -1, 0);
+        bpf_xdp_attach(ifindex_, -1, XDP_FLAGS_DRV_MODE, nullptr);
         attached_ = false;
     }
+
+    // Close tracepoint links (P-01)
+    close_tracepoints();
 
     if (obj_) {
         bpf_object__close(obj_);
@@ -307,6 +317,62 @@ bool EbpfLoader::load_bpf_object(const std::string& path) {
     return true;
 }
 
+/*
+ * P-01: attach_tracepoints - Attach tracepoint programs for process tracking
+ *
+ * Attaches tracepoint programs for monitoring connect() syscalls
+ * to correlate network traffic with processes.
+ */
+bool EbpfLoader::attach_tracepoints() {
+    struct bpf_program *prog;
+
+    // Attach sys_enter_connect tracepoint
+    prog = bpf_object__find_program_by_name(obj_, "trace_connect");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_connect");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_connect: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_connect tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_connect program not found in BPF object");
+    }
+
+    // Attach sys_exit_connect tracepoint
+    prog = bpf_object__find_program_by_name(obj_, "trace_connect_ret");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_exit_connect");
+        if (libbpf_get_error(link)) {
+            char err_buf[256];
+            libbpf_strerror(libbpf_get_error(link), err_buf, sizeof(err_buf));
+            LOG_ERR("ebpf", "failed to attach trace_connect_ret: %s", err_buf);
+        } else {
+            tracepoint_links_.push_back(link);
+            LOG_INFO("ebpf", "attached trace_connect_ret tracepoint");
+        }
+    } else {
+        LOG_WARN("ebpf", "trace_connect_ret program not found in BPF object");
+    }
+
+    return !tracepoint_links_.empty();
+}
+
+/*
+ * P-01: close_tracepoints - Close tracepoint program links
+ */
+void EbpfLoader::close_tracepoints() {
+    for (auto link : tracepoint_links_) {
+        if (link) {
+            bpf_link__destroy(link);
+        }
+    }
+    tracepoint_links_.clear();
+}
+
 bool EbpfLoader::attach_xdp() {
     int prog_fd = bpf_program__fd(prog_);
     if (prog_fd < 0) {
@@ -314,10 +380,10 @@ bool EbpfLoader::attach_xdp() {
         return false;
     }
 
-    int err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE);
+    int err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE, nullptr);
     if (err < 0) {
-        LOG_ERR("ebpf", "bpf_set_link_xdp_fd failed, trying SKB mode");
-        err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE);
+        LOG_ERR("ebpf", "bpf_xdp_attach failed, trying SKB mode");
+        err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE, nullptr);
         if (err < 0) {
             LOG_ERR("ebpf", "failed to attach XDP: %s (try running as root)", strerror(errno));
             return false;

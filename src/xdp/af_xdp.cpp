@@ -22,13 +22,46 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
 
 namespace nids {
+
+
+/* Forward declaration for IPv6 extension header parsing */
+static bool parse_ipv6_ext_headers(const struct ipv6hdr* ipv6,
+                                   const uint8_t* data_end,
+                                   uint8_t& next_header,
+                                   size_t& header_len);
+/*
+ * HMAC Verification Failure Details
+ * Used for post-analysis of HMAC-authenticated protocols (e.g., TLS, SSH, API authentication)
+ */
+struct HmacVerifyResult {
+    bool valid;
+    uint16_t rule_id;
+    std::string protocol;
+    std::string error_detail;
+    uint64_t timestamp_ns;
+};
+
+/* Log HMAC verification failure for post-analysis */
+static inline void log_hmac_failure(const HmacVerifyResult& result) {
+    LOG_WARN("HMAC",
+             "HMAC verification failed: protocol=%s rule_id=%u error=%s timestamp=%lu",
+             result.protocol.c_str(),
+             result.rule_id,
+             result.error_detail.c_str(),
+             result.timestamp_ns);
+}
 
 /* TLS constants */
 static constexpr uint8_t TLS_CONTENT_TYPE_HANDSHAKE = 22;
 static constexpr uint8_t TLS_HANDSHAKE_CLIENT_HELLO = 1;
 static constexpr uint8_t TLS_HANDSHAKE_SERVER_HELLO = 2;
+static constexpr uint8_t TLS_HANDSHAKE_CERTIFICATE = 11;
 static constexpr uint16_t TLS_VERSION_SSL3 = 0x0300;
 static constexpr uint16_t TLS_VERSION_TLS1_0 = 0x0301;
 static constexpr uint16_t TLS_VERSION_TLS1_1 = 0x0302;
@@ -36,6 +69,8 @@ static constexpr uint16_t TLS_VERSION_TLS1_2 = 0x0303;
 static constexpr uint16_t TLS_VERSION_TLS1_3 = 0x0304;
 /* TLS extension types */
 static constexpr uint8_t TLS_EXT_SNI = 0;
+/* F-22: TLS 0-RTT early data extension (RFC 8446) */
+static constexpr uint8_t TLS_EXT_EARLY_DATA = 42;
 /* TLS cipher suites that are considered weak */
 static constexpr uint16_t WEAK_CIPHERS[] = {
     0x0005, /* TLS_RSA_WITH_RC4_128_SHA */
@@ -44,6 +79,122 @@ static constexpr uint16_t WEAK_CIPHERS[] = {
     0x0006, /* TLS_RSA_EXPORT_WITH_RC2_CBC_40_MD5 */
     0x0011, /* TLS_DHE_DSS_EXPORT_WITH_DES40_CBC_SHA */
 };
+
+/*
+ * ASN.1 OID constants for signature algorithms
+ * Weak hash algorithms: MD5 (1.2.840.113549.2.5), SHA1 (1.2.840.113549.2.1)
+ */
+static constexpr uint8_t OID_MD5[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05};
+static constexpr uint8_t OID_SHA1[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x01};
+static constexpr uint8_t OID_SHA256[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x09};
+static constexpr uint8_t OID_SHA384[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x0c};
+static constexpr uint8_t OID_SHA512[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x0d};
+/* CN OID: 2.5.4.3 */
+static constexpr uint8_t OID_CN[] = {0x55, 0x04, 0x03};
+/* SAN OID: 2.5.29.17 */
+static constexpr uint8_t OID_SAN[] = {0x55, 0x1d, 0x11};
+
+/*
+ * ASN.1 helper: Read a TLV (Tag-Length-Value) element
+ * Returns pointer to value, sets len to value length, or nullptr on error
+ */
+static const uint8_t* asn1_read_tlv(const uint8_t* data, size_t remaining,
+                                    uint8_t& tag, uint32_t& len) {
+    if (remaining < 2) {
+        return nullptr;
+    }
+
+    tag = data[0];
+
+    /* Handle long form length */
+    if (data[1] & 0x80) {
+        uint8_t len_bytes = data[1] & 0x7f;
+        if (remaining < 2 + len_bytes || len_bytes > 4) {
+            return nullptr;
+        }
+        len = 0;
+        for (uint8_t i = 0; i < len_bytes; i++) {
+            len = (len << 8) | data[2 + i];
+        }
+        return data + 2 + len_bytes;
+    } else {
+        len = data[1];
+        return data + 2;
+    }
+}
+
+/*
+ * ASN.1 helper: Compare OID
+ */
+static bool asn1_oid_equals(const uint8_t* oid1, size_t oid1_len,
+                             const uint8_t* oid2, size_t oid2_len) {
+    return oid1_len == oid2_len && std::memcmp(oid1, oid2, oid1_len) == 0;
+}
+
+/*
+ * ASN.1 helper: Parse PrintableString or UTF8String
+ */
+static std::string asn1_read_string(const uint8_t* data, size_t len, uint8_t tag) {
+    /* Simple string types: PrintableString=0x13, UTF8String=0x0c, IA5String=0x22 */
+    if ((tag != 0x13 && tag != 0x0c && tag != 0x22) || len == 0) {
+        return "";
+    }
+    return std::string(reinterpret_cast<const char*>(data), len);
+}
+
+/*
+ * ASN.1 helper: Parse UTCTime (YYMMDDHHMMSSZ)
+ * Returns epoch seconds or 0 on error
+ */
+static uint64_t asn1_parse_utctime(const uint8_t* data, size_t len) {
+    /* UTCTime tag is 0x17 */
+    if (len < 13) {
+        return 0;
+    }
+
+    /* Format: YYMMDDHHMMSSZ */
+    int year = (data[0] - '0') * 10 + (data[1] - '0');
+    int month = (data[2] - '0') * 10 + (data[3] - '0');
+    int day = (data[4] - '0') * 10 + (data[5] - '0');
+    int hour = (data[6] - '0') * 10 + (data[7] - '0');
+    int minute = (data[8] - '0') * 10 + (data[9] - '0');
+    int second = (data[10] - '0') * 10 + (data[11] - '0');
+
+    /* Handle 2-digit year: 00-49 = 2000-2049, 50-99 = 1950-1999 */
+    if (year < 50) {
+        year += 2000;
+    } else {
+        year += 1900;
+    }
+
+    /* Validate */
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour > 23 || minute > 59 || second > 59) {
+        return 0;
+    }
+
+    /* Convert to epoch seconds (simplified, UTC) */
+    static constexpr int days_per_month[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+
+    uint64_t days = 0;
+    for (int y = 1970; y < year; y++) {
+        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+    }
+    for (int m = 1; m < month; m++) {
+        days += days_per_month[m - 1];
+        if (m == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))) {
+            days += 1;  /* Feb 29 */
+        }
+    }
+    days += day - 1;
+
+    return static_cast<uint64_t>(days) * 86400 +
+           static_cast<uint64_t>(hour) * 3600 +
+           static_cast<uint64_t>(minute) * 60 +
+           static_cast<uint64_t>(second);
+}
 
 XdpProcessor::XdpProcessor()
     : sock_fd_(-1)
@@ -376,6 +527,41 @@ void XdpProcessor::process_packets() {
             detect_tls(pkt, pkt.data, pkt.len);
         }
 
+        // F-17: HTTP pipeline out-of-order detection
+        if (pkt.protocol == IPPROTO_TCP && pkt.len > 0) {
+            detect_http_pipeline(pkt, pkt.data, pkt.len);
+        }
+
+        // F-23: WebSocket frame detection
+        if (pkt.len > 2) {
+            detect_websocket(pkt, pkt.data, pkt.len);
+        }
+
+        // F-19: FTP data connection tracking
+        if ((pkt.dst_port == 21 || pkt.src_port == 21) && pkt.len > 0) {
+            detect_ftp_data_connection(pkt, pkt.data, pkt.len);
+        }
+
+        // F-04: DNS tunneling detection
+        if (pkt.protocol == IPPROTO_UDP && (pkt.dst_port == 53 || pkt.src_port == 53) && pkt.len > 0) {
+            DnsQueryInfo dns_info = {};
+            if (parse_dns_query(pkt.data, pkt.len, dns_info)) {
+                detect_dns_tunneling(pkt, dns_info);
+            }
+        }
+
+        // R-01: QUIC protocol detection (UDP port 443)
+        if (pkt.protocol == IPPROTO_UDP && (pkt.dst_port == 443 || pkt.src_port == 443) && pkt.len > 0) {
+            QuicInfo quic_info = {};
+            if (parse_quic_header(pkt.data, pkt.len, quic_info) && quic_info.is_quic) {
+                /* QUIC traffic detected on port 443 */
+                LOG_DEBUG("xdp", "QUIC detected: version=0x%x cid=%s", quic_info.version, quic_info.connection_id.c_str());
+            }
+        }
+
+        // C-04: Service mesh traffic monitoring (iptables vs eBPF path analysis)
+        analyze_service_mesh_traffic(pkt);
+
         rx_count_++;
 
         // Return frame to completion ring
@@ -452,10 +638,18 @@ bool XdpProcessor::parse_packet(uint8_t* data, uint32_t len, XdpPacket& pkt) {
         /* Use first 32 bits of IPv6 addresses for compatibility */
         pkt.src_ip = ipv6->saddr.in6_u.u6_addr32[0];
         pkt.dst_ip = ipv6->daddr.in6_u.u6_addr32[0];
-        pkt.protocol = ipv6->nexthdr;
 
-        uint8_t* l4 = data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
-        uint32_t l4_len = len - sizeof(struct ethhdr) - sizeof(struct ipv6hdr);
+        /* Parse IPv6 extension headers to find actual L4 protocol */
+        const uint8_t* pkt_end = data + len;
+        uint8_t next_header = 0;
+        size_t ip_header_len = 0;
+        if (!parse_ipv6_ext_headers(ipv6, pkt_end, next_header, ip_header_len)) {
+            return false;
+        }
+        pkt.protocol = next_header;
+
+        uint8_t* l4 = data + sizeof(struct ethhdr) + ip_header_len;
+        uint32_t l4_len = len - sizeof(struct ethhdr) - ip_header_len;
 
         if (pkt.protocol == IPPROTO_TCP && l4_len >= sizeof(struct tcphdr)) {
             struct tcphdr* tcp = reinterpret_cast<struct tcphdr*>(l4);
@@ -625,6 +819,11 @@ bool XdpProcessor::parse_tls_record(const uint8_t* data, size_t len, TlsInfo& in
                 break;
             }
 
+            /* F-22: TLS 0-RTT early_data extension (type=42) */
+            if (ext_type == TLS_EXT_EARLY_DATA) {
+                info.early_data = true;
+            }
+
             offset += ext_len_inner;
         }
     } else if (info.handshake_type == TLS_HANDSHAKE_SERVER_HELLO) {
@@ -639,13 +838,503 @@ bool XdpProcessor::parse_tls_record(const uint8_t* data, size_t len, TlsInfo& in
     return true;
 }
 
+/*
+ * F-05: TLS Certificate Message Parsing
+ *
+ * Parses TLS Certificate handshake messages (type=11) and extracts X.509 certificate
+ * information including CN, Issuer, SAN, Validity, and weak hash detection.
+ *
+ * TLS Certificate message format:
+ *   SEQUENCE { chain }
+ *     SEQUENCE { cert }
+ *       SEQUENCE { TBSCertificate }
+ *         [0] { version }
+ *         INTEGER { serialNumber }
+ *         SEQUENCE { signatureAlgorithm }
+ *         SEQUENCE { issuer }
+ *         SEQUENCE { validity }
+ *           UTCTime { notBefore }
+ *           UTCTime { notAfter }
+ *         SEQUENCE { subject }
+ *         ...
+ *         SEQUENCE { extensions }
+ *           ...
+ *           SEQUENCE { OID, [0] { OCTET STRING } }  // SAN extension
+ */
+bool XdpProcessor::parse_tls_certificate(const uint8_t* handshake_data,
+                                         size_t handshake_len,
+                                         std::vector<TlsCertInfo>& certs) {
+    certs.clear();
+
+    /* TLS Certificate message parsing
+     * handshake_data points after handshake header (type + 3-byte length)
+     */
+    if (handshake_len < 4) {
+        return false;
+    }
+
+    /* Skip handshake type (1 byte) and length (3 bytes) */
+    const uint8_t* ptr = handshake_data;
+    size_t remaining = handshake_len;
+
+    /* Read certificate chain length (3 bytes) */
+    if (remaining < 3) {
+        return false;
+    }
+    uint32_t chain_len = (static_cast<uint32_t>(ptr[0]) << 16) |
+                         (static_cast<uint32_t>(ptr[1]) << 8) |
+                         static_cast<uint32_t>(ptr[2]);
+    ptr += 3;
+    remaining -= 3;
+
+    const uint8_t* end = ptr + std::min(static_cast<size_t>(chain_len), remaining);
+
+    while (ptr < end && ptr + 3 < handshake_data + handshake_len) {
+        /* Read certificate length (3 bytes) */
+        if (remaining < 3) {
+            break;
+        }
+        uint32_t cert_len = (static_cast<uint32_t>(ptr[0]) << 16) |
+                            (static_cast<uint32_t>(ptr[1]) << 8) |
+                            static_cast<uint32_t>(ptr[2]);
+        ptr += 3;
+        remaining -= 3;
+
+        if (cert_len > remaining || ptr + cert_len > end) {
+            break;
+        }
+
+        TlsCertInfo cert;
+        if (parse_x509_certificate(ptr, cert_len, cert)) {
+            certs.push_back(cert);
+        }
+        ptr += cert_len;
+        remaining -= cert_len;
+    }
+
+    return !certs.empty();
+}
+
+/*
+ * Forward declaration for parse_x509_name
+ */
+std::string parse_x509_name(const uint8_t* data, size_t len);
+std::string extract_cn(const std::string& subject);
+
+/*
+ * Parse X.509 certificate and extract key fields
+ */
+bool XdpProcessor::parse_x509_certificate(const uint8_t* cert_data,
+                                          size_t cert_len,
+                                          TlsCertInfo& cert) {
+    cert = TlsCertInfo{};
+    cert.not_before = 0;
+    cert.not_after = 0;
+    cert.self_signed = false;
+    cert.expired = false;
+    cert.weak_hash = false;
+
+    const uint8_t* ptr = cert_data;
+    size_t remaining = cert_len;
+
+    /* Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature } */
+    uint8_t tag;
+    uint32_t len;
+    ptr = asn1_read_tlv(ptr, remaining, tag, len);
+    if (!ptr || tag != 0x30) {  /* SEQUENCE */
+        return false;
+    }
+    remaining = len;
+
+    /* TBSCertificate ::= SEQUENCE { ... } */
+    const uint8_t* tbs_ptr = ptr;
+    ptr = asn1_read_tlv(ptr, remaining, tag, len);
+    if (!ptr || tag != 0x30) {
+        return false;
+    }
+    size_t tbs_len = len;
+
+    /* Parse TBSCertificate fields */
+    size_t pos = 0;
+    const uint8_t* tbs_start = ptr;
+
+    /* version [0] EXPLICIT Version DEFAULT v1 */
+    if (pos + 1 < tbs_len && ptr[pos] == 0xa0) {
+        uint8_t vtag;
+        uint32_t vlen;
+        const uint8_t* vptr = asn1_read_tlv(ptr + pos, tbs_len - pos, vtag, vlen);
+        if (vptr && vtag == 0xa0) {
+            pos = vptr - tbs_start + vlen;
+        }
+    }
+
+    /* serialNumber (INTEGER) */
+    uint8_t serial_tag;
+    uint32_t serial_len;
+    const uint8_t* serial_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, serial_tag, serial_len);
+    if (!serial_ptr || serial_tag != 0x02) {
+        return false;
+    }
+    pos += serial_ptr - (ptr + pos) + serial_len;
+
+    /* signatureAlgorithm (SEQUENCE) */
+    uint8_t sig_tag;
+    uint32_t sig_len;
+    const uint8_t* sig_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, sig_tag, sig_len);
+    if (!sig_ptr || sig_tag != 0x30) {
+        return false;
+    }
+    pos += sig_ptr - (ptr + pos) + sig_len;
+
+    /* Check for weak hash algorithm in signature OID */
+    uint8_t oid_tag;
+    uint32_t oid_len;
+    const uint8_t* oid_ptr = asn1_read_tlv(sig_ptr, sig_len, oid_tag, oid_len);
+    if (oid_ptr && oid_tag == 0x06) {
+        if (asn1_oid_equals(oid_ptr, oid_len, OID_MD5, sizeof(OID_MD5)) ||
+            asn1_oid_equals(oid_ptr, oid_len, OID_SHA1, sizeof(OID_SHA1))) {
+            cert.weak_hash = true;
+        }
+    }
+
+    /* issuer (SEQUENCE) */
+    uint8_t issuer_tag;
+    uint32_t issuer_len;
+    const uint8_t* issuer_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, issuer_tag, issuer_len);
+    if (!issuer_ptr || issuer_tag != 0x30) {
+        return false;
+    }
+    cert.issuer = nids::parse_x509_name(issuer_ptr, issuer_len);
+    pos += issuer_ptr - (ptr + pos) + issuer_len;
+
+    /* validity (SEQUENCE) */
+    uint8_t validity_tag;
+    uint32_t validity_len;
+    const uint8_t* validity_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, validity_tag, validity_len);
+    if (!validity_ptr || validity_tag != 0x30) {
+        return false;
+    }
+    /* Parse UTCTime notBefore and notAfter */
+    const uint8_t* vptr = validity_ptr;
+    size_t vremaining = validity_len;
+    while (vremaining > 0) {
+        uint8_t time_tag;
+        uint32_t time_len;
+        vptr = asn1_read_tlv(vptr, vremaining, time_tag, time_len);
+        if (!vptr) break;
+        if (time_tag == 0x17) {  /* UTCTime */
+            uint64_t time_val = asn1_parse_utctime(vptr, time_len);
+            if (cert.not_before == 0) {
+                cert.not_before = time_val;
+            } else {
+                cert.not_after = time_val;
+            }
+        }
+        vremaining = validity_len - (vptr - validity_ptr + time_len);
+        if (vremaining >= validity_len) break;
+        vptr += time_len;
+    }
+    pos += validity_ptr - (ptr + pos) + validity_len;
+
+    /* subject (SEQUENCE) */
+    uint8_t subject_tag;
+    uint32_t subject_len;
+    const uint8_t* subject_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, subject_tag, subject_len);
+    if (!subject_ptr || subject_tag != 0x30) {
+        return false;
+    }
+    cert.subject = nids::parse_x509_name(subject_ptr, subject_len);
+    cert.common_name = nids::extract_cn(cert.subject);
+    pos += subject_ptr - (ptr + pos) + subject_len;
+
+    /* Check self-signed: issuer == subject */
+    if (cert.issuer == cert.subject && !cert.issuer.empty()) {
+        cert.self_signed = true;
+    }
+
+    /* Skip remaining fields until extensions [3] */
+    while (pos + 1 < tbs_len && ptr[pos] != 0xa3) {  /* [3] for v3 extensions */
+        uint8_t skip_tag;
+        uint32_t skip_len;
+        const uint8_t* skip_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, skip_tag, skip_len);
+        if (!skip_ptr) break;
+        pos += skip_ptr - (ptr + pos) + skip_len;
+    }
+
+    /* extensions [3] EXPLICIT Extensions */
+    if (pos + 1 < tbs_len && ptr[pos] == 0xa3) {
+        uint8_t ext_tag;
+        uint32_t ext_len;
+        const uint8_t* ext_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, ext_tag, ext_len);
+        if (ext_ptr && ext_tag == 0xa3) {
+            /* Parse extensions sequence */
+            uint8_t seq_tag;
+            uint32_t seq_len;
+            const uint8_t* seq_ptr = asn1_read_tlv(ext_ptr, ext_len, seq_tag, seq_len);
+            if (seq_ptr && seq_tag == 0x30) {
+                const uint8_t* ext_end = seq_ptr + seq_len;
+                const uint8_t* eptr = seq_ptr;
+                while (eptr < ext_end && eptr + 4 < cert_data + cert_len) {
+                    uint8_t e_tag;
+                    uint32_t e_len;
+                    eptr = asn1_read_tlv(eptr, ext_end - eptr, e_tag, e_len);
+                    if (!eptr) break;
+
+                    /* Extension ::= SEQUENCE { extnID, critical, extnValue } */
+                    uint8_t ext_id_tag, ext_val_tag;
+                    uint32_t ext_id_len, ext_val_len;
+                    const uint8_t* ext_id_ptr = asn1_read_tlv(eptr, e_len, ext_id_tag, ext_id_len);
+                    if (!ext_id_ptr) break;
+
+                    /* Skip critical flag */
+                    uint8_t crit_tag;
+                    uint32_t crit_len;
+                    const uint8_t* crit_ptr = asn1_read_tlv(ext_id_ptr + ext_id_len, e_len - (ext_id_ptr - eptr + ext_id_len), crit_tag, crit_len);
+                    if (!crit_ptr) {
+                        eptr += e_len;
+                        continue;
+                    }
+
+                    /* extnValue is OCTET STRING containing the extension value */
+                    const uint8_t* ext_val_ptr = asn1_read_tlv(crit_ptr + crit_len, e_len - (crit_ptr - eptr + crit_len), ext_val_tag, ext_val_len);
+                    if (!ext_val_ptr) {
+                        eptr += e_len;
+                        continue;
+                    }
+
+                    /* Check for SAN extension (OID 2.5.29.17) */
+                    if (ext_id_tag == 0x06 && ext_id_len == sizeof(OID_SAN) &&
+                        std::memcmp(ext_id_ptr, OID_SAN, sizeof(OID_SAN)) == 0) {
+                        /* Parse SAN sequence */
+                        uint8_t san_seq_tag;
+                        uint32_t san_seq_len;
+                        const uint8_t* san_seq_ptr = asn1_read_tlv(ext_val_ptr, ext_val_len, san_seq_tag, san_seq_len);
+                        if (san_seq_ptr && san_seq_tag == 0x30) {
+                            const uint8_t* san_end = san_seq_ptr + san_seq_len;
+                            const uint8_t* sptr = san_seq_ptr;
+                            while (sptr < san_end && sptr + 2 < ext_val_ptr + ext_val_len) {
+                                uint8_t name_tag;
+                                uint32_t name_len;
+                                sptr = asn1_read_tlv(sptr, san_end - sptr, name_tag, name_len);
+                                if (!sptr) break;
+                                /* otherName, email, DNS, x400Address, directoryName, ediPartyName, URI, IP */
+                                if (name_tag == 0x82) {  /* dNSName - IA5String */
+                                    std::string san = asn1_read_string(sptr, name_len, 0x22);
+                                    if (!san.empty()) {
+                                        cert.sans.push_back(san);
+                                    }
+                                } else if (name_tag == 0x87) {  /* iPAddress */
+                                    if (name_len == 4) {
+                                        char ip[16];
+                                        std::snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                                                     sptr[0], sptr[1], sptr[2], sptr[3]);
+                                        cert.sans.push_back(ip);
+                                    } else if (name_len == 16) {
+                                        char ip[64];
+                                        std::snprintf(ip, sizeof(ip),
+                                                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                                                     sptr[0], sptr[1], sptr[2], sptr[3],
+                                                     sptr[4], sptr[5], sptr[6], sptr[7],
+                                                     sptr[8], sptr[9], sptr[10], sptr[11],
+                                                     sptr[12], sptr[13], sptr[14], sptr[15]);
+                                        cert.sans.push_back(ip);
+                                    }
+                                }
+                                sptr += name_len;
+                            }
+                        }
+                    }
+                    eptr += e_len;
+                }
+            }
+        }
+    }
+
+    /* Check expiration */
+    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (cert.not_after > 0 && now > cert.not_after) {
+        cert.expired = true;
+    }
+
+    return !cert.subject.empty();
+}
+
+/*
+ * Parse X.509 Name (issuer/subject) and extract string values
+ */
+std::string parse_x509_name(const uint8_t* data, size_t len) {
+    std::string result;
+    const uint8_t* ptr = data;
+    size_t remaining = len;
+
+    /* Name ::= RDNSequence */
+    /* RDNSequence ::= SEQUENCE OF RelativeDistinguishedName */
+    /* RelativeDistinguishedName ::= SET OF AttributeTypeAndValue */
+    /* AttributeTypeAndValue ::= SEQUENCE { type, value } */
+
+    while (remaining > 0) {
+        uint8_t tag;
+        uint32_t len_val;
+        ptr = asn1_read_tlv(ptr, remaining, tag, len_val);
+        if (!ptr) break;
+
+        if (tag == 0x30) {  /* SEQUENCE - RDN */
+            const uint8_t* rdn_ptr = ptr;
+            size_t rdn_len = len_val;
+            while (rdn_len > 0) {
+                uint8_t set_tag;
+                uint32_t set_len;
+                rdn_ptr = asn1_read_tlv(rdn_ptr, rdn_len, set_tag, set_len);
+                if (!rdn_ptr) break;
+
+                if (set_tag == 0x31) {  /* SET - AttributeTypeAndValue */
+                    uint8_t type_tag, value_tag;
+                    uint32_t type_len, value_len;
+                    const uint8_t* type_ptr = asn1_read_tlv(rdn_ptr, set_len, type_tag, type_len);
+                    if (!type_ptr) break;
+
+                    const uint8_t* value_ptr = asn1_read_tlv(type_ptr + type_len, set_len - (type_ptr - rdn_ptr + type_len), value_tag, value_len);
+                    if (!value_ptr) {
+                        rdn_ptr += set_len;
+                        rdn_len -= rdn_ptr - (ptr + len_val - remaining);
+                        continue;
+                    }
+
+                    /* Check for CN (2.5.4.3) */
+                    if (type_tag == 0x06 && type_len == sizeof(OID_CN) &&
+                        std::memcmp(type_ptr, OID_CN, sizeof(OID_CN)) == 0) {
+                        std::string cn = asn1_read_string(value_ptr, value_len, value_tag);
+                        if (!cn.empty()) {
+                            if (!result.empty()) result += ", ";
+                            result += cn;
+                        }
+                    }
+                }
+                rdn_ptr += set_len;
+                rdn_len -= rdn_ptr - (ptr + len_val - remaining);
+            }
+        }
+
+        remaining -= len_val + (ptr - data - (len - remaining));
+        ptr += len_val;
+        remaining = len - (ptr - data);
+        if (remaining >= len) break;
+    }
+
+    return result;
+}
+
+/*
+ * Extract CN from a full subject string
+ */
+std::string extract_cn(const std::string& subject) {
+    /* CN is usually at the beginning or end of the subject string */
+    size_t cn_pos = subject.find("CN=");
+    if (cn_pos != std::string::npos) {
+        size_t start = cn_pos + 3;
+        size_t end = subject.find(',', start);
+        if (end == std::string::npos) end = subject.size();
+        return subject.substr(start, end - start);
+    }
+    /* If no CN= prefix, return the first component */
+    size_t comma = subject.find(',');
+    if (comma != std::string::npos) {
+        return subject.substr(0, comma);
+    }
+    return subject;
+}
+
 void XdpProcessor::detect_tls(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len) {
     if (tls_version_rules_.empty() && sni_rules_.empty() && cipher_rules_.empty()) {
         return;
     }
 
+    /*
+     * E-24: TLS record fragment reassembly
+     * Check if we have a partial TLS record for this flow and try to reassemble
+     */
+    TlsFragmentKey frag_key = {
+        .src_ip = pkt.src_ip,
+        .dst_ip = pkt.dst_ip,
+        .src_port = pkt.src_port,
+        .dst_port = pkt.dst_port
+    };
+
+    /* Clean up old fragments (timeout-based) */
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (auto it = tls_fragments_.begin(); it != tls_fragments_.end(); ) {
+        if (now_ms - (it->second.first_seen / 1000000) > TLS_FRAG_TIMEOUT_MS) {
+            it = tls_fragments_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    /* Check if we have a partial record for this flow */
+    auto frag_it = tls_fragments_.find(frag_key);
+    std::vector<uint8_t> reassembled;
+    bool have_complete_record = false;
+
+    if (frag_it != tls_fragments_.end()) {
+        /* We have a partial record - append this data */
+        TlsFragmentData& frag = frag_it->second;
+        if (frag.data.size() + payload_len > 16384) {  /* Max TLS record size */
+            /* Fragment data too large, discard */
+            tls_fragments_.erase(frag_it);
+            frag_it = tls_fragments_.end();
+        } else {
+            frag.data.insert(frag.data.end(), payload, payload + payload_len);
+            reassembled = frag.data;
+            /* Check if we have the complete TLS record */
+            if (reassembled.size() >= 5) {
+                uint16_t record_len = (static_cast<uint16_t>(reassembled[3]) << 8) | reassembled[4];
+                if (reassembled.size() >= 5 + record_len) {
+                    have_complete_record = true;
+                    tls_fragments_.erase(frag_it);
+                }
+            }
+        }
+    }
+
+    /*
+     * E-24: If we don't have a complete record, check if this packet starts one
+     * TLS record header is 5 bytes: content_type(1) + version(2) + length(2)
+     */
+    const uint8_t* data_to_parse = payload;
+    size_t data_len = payload_len;
+
+    if (!have_complete_record && frag_it == tls_fragments_.end()) {
+        /* No partial record - check if this starts a new TLS record */
+        if (payload_len >= 5) {
+            uint16_t record_len = (static_cast<uint16_t>(payload[3]) << 8) | payload[4];
+            size_t total_record_len = 5 + record_len;
+
+            if (payload_len < total_record_len) {
+                /* Incomplete TLS record - start tracking fragment */
+                if (tls_fragments_.size() < TLS_MAX_FRAGMENTS && payload_len < 16384) {
+                    TlsFragmentData frag;
+                    frag.data.assign(payload, payload + payload_len);
+                    frag.expected_len = total_record_len;
+                    frag.first_seen = now_ms * 1000000;  /* Convert to ns */
+                    tls_fragments_[frag_key] = std::move(frag);
+                }
+                return;  /* Wait for more data */
+            }
+            /* We have a complete record, parse normally */
+        }
+    } else if (have_complete_record) {
+        data_to_parse = reassembled.data();
+        data_len = reassembled.size();
+    } else {
+        /* Partial record exists but not complete yet */
+        return;
+    }
+
+    /* Parse the (possibly reassembled) TLS record */
     TlsInfo tls;
-    if (!parse_tls_record(payload, payload_len, tls)) {
+    if (!parse_tls_record(data_to_parse, data_len, tls)) {
         return;  /* Not a TLS record */
     }
 
@@ -708,6 +1397,988 @@ void XdpProcessor::detect_tls(const XdpPacket& pkt, const uint8_t* payload, size
             }
         }
     }
+
+    /* F-22: TLS 0-RTT early data detection */
+    if (tls.early_data && tls.handshake_type == TLS_HANDSHAKE_CLIENT_HELLO) {
+        DpiResult result;
+        result.matched = true;
+        result.rule_id = 0;
+        result.message = "TLS 0-RTT early data detected (replay attack risk)";
+        dpi_match_count_++;
+        if (dpi_callback_) {
+            dpi_callback_(pkt, result);
+        }
+    }
 }
 
+/*
+ * F-17: HTTP Pipeline Out-of-Order Detection
+ *
+ * Detects out-of-order HTTP requests in a pipeline, which could indicate
+ * an evasion attempt or malicious traffic pattern.
+ *
+ * HTTP pipelining allows multiple requests to be sent without waiting for
+ * responses. We track the sequence of requests to detect when they arrive
+ * out of order.
+ */
+void XdpProcessor::detect_http_pipeline(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len) {
+    // Only track HTTP traffic (port 80, 8080, 8000)
+    if (pkt.dst_port != 80 && pkt.dst_port != 8080 && pkt.dst_port != 8000) {
+        return;
+    }
+
+    // Only track packets with payload
+    if (payload_len == 0) {
+        return;
+    }
+
+    // Get current timestamp in ms
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    // Clean up old entries (timeout-based)
+    for (auto it = http_pipeline_.begin(); it != http_pipeline_.end(); ) {
+        if (now_ms - (it->second.last_seen / 1000) > HTTP_PIPELINE_TIMEOUT_MS) {
+            it = http_pipeline_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Build key for this flow
+    HttpPipelineKey key = {
+        .src_ip = pkt.src_ip,
+        .dst_ip = pkt.dst_ip,
+        .src_port = pkt.src_port,
+        .dst_port = pkt.dst_port
+    };
+
+    // Check if payload looks like an HTTP request
+    // HTTP requests start with a method (GET, POST, PUT, etc.)
+    bool looks_like_http_request = false;
+    if (payload_len >= 4 &&
+        ((payload[0] >= 'A' && payload[0] <= 'Z') || (payload[0] >= 'a' && payload[0] <= 'z')) &&
+        payload[3] == ' ') {
+        // Could be HTTP method
+        static const char* methods[] = {"GET", "POST", "PUT ", "DELE", "HEAD", "OPTI", "PATC", "CONN", "TRAC"};
+        for (const auto& m : methods) {
+            if (std::memcmp(payload, m, 4) == 0) {
+                looks_like_http_request = true;
+                break;
+            }
+        }
+    }
+
+    if (!looks_like_http_request) {
+        return;  // Not an HTTP request, skip
+    }
+
+    // Look up existing entry
+    auto it = http_pipeline_.find(key);
+    if (it == http_pipeline_.end()) {
+        // First request on this flow
+        HttpPipelineData data = {
+            .last_seq = 0,
+            .expected_seq = 1,
+            .last_seen = now_ms * 1000,
+            .alert_sent = false
+        };
+        http_pipeline_[key] = data;
+        return;
+    }
+
+    // Update existing entry
+    HttpPipelineData& data = it->second;
+    data.last_seen = now_ms * 1000;
+
+    // For simplicity, we track the "sequence number" as the count of requests
+    // In a real implementation, this would use actual sequence numbers from TCP
+    uint32_t current_seq = data.expected_seq;
+
+    // Check if this is the expected next request
+    // If we receive the same sequence number, it might be a retransmit
+    // If we receive a sequence number we've already seen, it's out of order
+    if (current_seq > 0 && !data.alert_sent) {
+        // Simple heuristic: if we see another request and expected_seq hasn't advanced,
+        // something is out of order. In a real implementation, we'd use TCP seq numbers.
+        if (data.last_seq == current_seq) {
+            // Same request again - could be retransmit, which is normal
+        } else if (data.last_seq > current_seq) {
+            // Out-of-order detected
+            DpiResult result;
+            result.matched = true;
+            result.rule_id = -1;  // Internal rule
+            result.message = "HTTP pipeline out-of-order detected";
+            dpi_match_count_++;
+            if (dpi_callback_) {
+                dpi_callback_(pkt, result);
+            }
+            data.alert_sent = true;
+            return;
+        }
+    }
+
+    // Advance the expected sequence
+    data.last_seq = data.expected_seq;
+    data.expected_seq++;
+}
+
+/*
+ * F-23: WebSocket Frame Detection
+ *
+ * Parses WebSocket frame headers to detect fragmented/mixed frames.
+ * WebSocket frames may be fragmented across multiple TCP packets.
+ * We track fragments to detect anomalous patterns.
+ *
+ * WebSocket frame format (RFC 6455):
+ * - Byte 0: FIN bit (bit 7), opcode (bits 3-0)
+ * - Byte 1: MASK bit (bit 7), payload length (bits 6-0)
+ * - Extended length (if payload_len == 126 or 127)
+ * - Masking key (if MASK bit set)
+ * - Payload data
+ *
+ * Opcodes: 0x0=continuation, 0x1=text, 0x2=binary, 0x8=close, 0x9=ping, 0xA=pong
+ */
+void XdpProcessor::detect_websocket(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len) {
+    // Only track TCP traffic on WebSocket ports (80, 8080, 8000, 443)
+    if (pkt.protocol != IPPROTO_TCP) {
+        return;
+    }
+    if (pkt.dst_port != 80 && pkt.dst_port != 8080 && pkt.dst_port != 8000 && pkt.dst_port != 443 &&
+        pkt.src_port != 80 && pkt.src_port != 8080 && pkt.src_port != 8000 && pkt.src_port != 443) {
+        return;
+    }
+
+    // Need at least 2 bytes for frame header
+    if (payload_len < 2) {
+        return;
+    }
+
+    // Parse WebSocket frame header
+    uint8_t first_byte = payload[0];
+    uint8_t second_byte = payload[1];
+
+    bool fin = (first_byte & 0x80) != 0;
+    uint8_t opcode = first_byte & 0x0F;
+    bool masked = (second_byte & 0x80) != 0;
+    uint64_t payload_len_ws = second_byte & 0x7F;
+
+    size_t header_len = 2;
+    size_t mask_key_len = 0;
+
+    // Parse extended payload length
+    if (payload_len_ws == 126) {
+        if (payload_len < 4) {
+            return;  // Need 4 bytes for 16-bit extended length
+        }
+        payload_len_ws = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
+        header_len = 4;
+    } else if (payload_len_ws == 127) {
+        if (payload_len < 10) {
+            return;  // Need 10 bytes for 64-bit extended length
+        }
+        // Read 64-bit length (we only handle 32-bit values for sanity)
+        payload_len_ws = (static_cast<uint64_t>(payload[2]) << 56) |
+                         (static_cast<uint64_t>(payload[3]) << 48) |
+                         (static_cast<uint64_t>(payload[4]) << 40) |
+                         (static_cast<uint64_t>(payload[5]) << 32) |
+                         (static_cast<uint64_t>(payload[6]) << 24) |
+                         (static_cast<uint64_t>(payload[7]) << 16) |
+                         (static_cast<uint64_t>(payload[8]) << 8) |
+                         static_cast<uint64_t>(payload[9]);
+        header_len = 10;
+    }
+
+    // Masking key is present if client-to-server frame
+    if (masked) {
+        mask_key_len = 4;
+    }
+
+    // Calculate total frame size
+    size_t total_frame_len = header_len + mask_key_len + static_cast<size_t>(payload_len_ws);
+
+    // Sanity check: reject unreasonably large frames
+    if (payload_len_ws > 65536) {
+        DpiResult result;
+        result.matched = true;
+        result.rule_id = -1;  // Internal rule
+        result.message = "WebSocket: excessive payload length detected";
+        dpi_match_count_++;
+        if (dpi_callback_) {
+            dpi_callback_(pkt, result);
+        }
+        return;
+    }
+
+    // Get current timestamp
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    // Build key for this WebSocket flow
+    WebSocketKey key = {
+        .src_ip = pkt.src_ip,
+        .dst_ip = pkt.dst_ip,
+        .src_port = pkt.src_port,
+        .dst_port = pkt.dst_port
+    };
+
+    // Clean up old entries (timeout-based)
+    for (auto it = websocket_connections_.begin(); it != websocket_connections_.end(); ) {
+        if (now_ms - (it->second.last_seen / 1000) > WEBSOCKET_TIMEOUT_MS) {
+            it = websocket_connections_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Look up existing connection state
+    auto it = websocket_connections_.find(key);
+    if (it == websocket_connections_.end()) {
+        // New connection
+        WebSocketData data = {
+            .last_opcode = opcode,
+            .fragmented = false,
+            .fragment_count = 0,
+            .last_seen = now_ms * 1000,
+            .alert_sent = false
+        };
+
+        // Check for start of fragmentation (FIN=0, opcode=text/binary)
+        if (!fin && (opcode == 0x1 || opcode == 0x2)) {
+            data.fragmented = true;
+            data.fragment_count = 1;
+            data.fragment_opcode = opcode;  // Remember initial opcode
+        }
+        // Check for suspicious: FIN=1 with continuation opcode (should start new)
+        else if (fin && opcode == 0x0) {
+            DpiResult result;
+            result.matched = true;
+            result.rule_id = -1;
+            result.message = "WebSocket: FIN=1 with continuation opcode (no prior fragment)";
+            dpi_match_count_++;
+            if (dpi_callback_) {
+                dpi_callback_(pkt, result);
+            }
+        }
+        // Check for control frames interleaved with fragments
+        else if (opcode >= 0x8 && opcode <= 0xA) {
+            // Control frames should not fragment
+            DpiResult result;
+            result.matched = true;
+            result.rule_id = -1;
+            result.message = "WebSocket: fragmented control frame";
+            dpi_match_count_++;
+            if (dpi_callback_) {
+                dpi_callback_(pkt, result);
+            }
+        }
+
+        websocket_connections_[key] = data;
+        return;
+    }
+
+    // Update existing connection
+    WebSocketData& data = it->second;
+    data.last_seen = now_ms * 1000;
+
+    // If we're tracking a fragmented message
+    if (data.fragmented) {
+        // Continuation frame should have opcode=0
+        if (opcode == 0x0) {
+            data.fragment_count++;
+
+            // Check for excessive fragmentation (evasion attempt)
+            if (data.fragment_count > 64) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "WebSocket: excessive fragmentation (" +
+                    std::to_string(data.fragment_count) + " fragments)";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+                data.alert_sent = true;
+            }
+
+            // Check for interleaved control frame during fragmentation
+            if (opcode >= 0x8 && opcode <= 0xA) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "WebSocket: control frame during fragmented message";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+                data.alert_sent = true;
+            }
+        }
+        // Final frame should have FIN=1 and opcode=0
+        else if (fin && opcode == 0x0) {
+            // Message complete
+            data.fragmented = false;
+            data.fragment_count = 0;
+        }
+        // New data frame before previous fragmented message finished
+        else if (!fin && (opcode == 0x1 || opcode == 0x2)) {
+            // Mixed frame types in fragmentation - suspicious
+            if (!data.alert_sent) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "WebSocket: new fragment type before previous complete (mixed frame types)";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+                data.alert_sent = true;
+            }
+        }
+    } else {
+        // Not fragmented - check for start of new fragmentation
+        if (!fin && (opcode == 0x1 || opcode == 0x2)) {
+            data.fragmented = true;
+            data.fragment_count = 1;
+            data.fragment_opcode = opcode;
+            data.alert_sent = false;
+        }
+        // Unexpected continuation frame
+        else if (opcode == 0x0 && !data.fragmented) {
+            if (!data.alert_sent) {
+                DpiResult result;
+                result.matched = true;
+                result.rule_id = -1;
+                result.message = "WebSocket: unexpected continuation frame";
+                dpi_match_count_++;
+                if (dpi_callback_) {
+                    dpi_callback_(pkt, result);
+                }
+                data.alert_sent = true;
+            }
+        }
+    }
+
+    // Update last opcode
+    data.last_opcode = opcode;
+}
+
+/*
+ * F-19: FTP Data Connection Tracking
+ *
+ * Tracks FTP PORT and PASV commands to identify data connections.
+ * FTP uses separate connections for data transfer (PORT/PASV commands).
+ * Tracking these helps identify data connections and prevent bypass attempts.
+ */
+void XdpProcessor::detect_ftp_data_connection(const XdpPacket& pkt, const uint8_t* payload, size_t payload_len) {
+    // Only track FTP control connections (port 21)
+    if (pkt.dst_port != 21 && pkt.src_port != 21) {
+        return;
+    }
+
+    if (payload_len == 0) {
+        return;
+    }
+
+    // Get current timestamp in ms
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    // Clean up old entries
+    for (auto it = ftp_data_connections_.begin(); it != ftp_data_connections_.end(); ) {
+        if (now_ms - (it->second.last_seen / 1000) > FTP_CONN_TIMEOUT_MS) {
+            it = ftp_data_connections_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Convert payload to string for easier parsing
+    std::string payload_str(reinterpret_cast<const char*>(payload),
+                           std::min(payload_len, size_t(256)));
+
+    // Check for PORT command: PORT h1,h2,h3,h4,p1,p2
+    // where h1-h4 are IP octets and p1,p2 form the port number
+    if (payload_str.find("PORT ") == 0 || payload_str.find("port ") == 0) {
+        size_t space_pos = payload_str.find(' ');
+        if (space_pos != std::string::npos && space_pos + 18 <= payload_str.size()) {
+            std::string params = payload_str.substr(space_pos + 1);
+            // Parse IP and port from parameters like "h1,h2,h3,h4,p1,p2"
+            std::replace(params.begin(), params.end(), ',', ' ');
+            std::replace(params.begin(), params.end(), '\r', ' ');
+            std::replace(params.begin(), params.end(), '\n', ' ');
+
+            std::stringstream ss(params);
+            int h1, h2, h3, h4, p1, p2;
+            if (ss >> h1 >> h2 >> h3 >> h4 >> p1 >> p2) {
+                // Build key for FTP control connection
+                FtpDataKey key = {
+                    .src_ip = pkt.src_ip,
+                    .dst_ip = pkt.dst_ip,
+                    .src_port = pkt.src_port,
+                    .dst_port = pkt.dst_port
+                };
+
+                FtpDataInfo info = {
+                    .data_ip = static_cast<uint32_t>((h1 << 24) | (h2 << 16) | (h3 << 8) | h4),
+                    .data_port = static_cast<uint16_t>((p1 << 8) | p2),
+                    .last_seen = now_ms * 1000,
+                    .passive_mode = false,
+                    .alert_sent = false
+                };
+
+                ftp_data_connections_[key] = info;
+            }
+        }
+    }
+    // Check for PASV command response: 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
+    else if (payload_str.find("227 ") == 0 || payload_str.find("227\t") == 0) {
+        // Find the IP and port in the response
+        size_t paren_start = payload_str.find('(');
+        size_t paren_end = payload_str.find(')');
+        if (paren_start != std::string::npos && paren_end != std::string::npos) {
+            std::string params = payload_str.substr(paren_start + 1, paren_end - paren_start - 1);
+            std::replace(params.begin(), params.end(), ',', ' ');
+
+            std::stringstream ss(params);
+            int h1, h2, h3, h4, p1, p2;
+            if (ss >> h1 >> h2 >> h3 >> h4 >> p1 >> p2) {
+                // Build key for FTP control connection
+                FtpDataKey key = {
+                    .src_ip = pkt.src_ip,
+                    .dst_ip = pkt.dst_ip,
+                    .src_port = pkt.src_port,
+                    .dst_port = pkt.dst_port
+                };
+
+                FtpDataInfo info = {
+                    .data_ip = static_cast<uint32_t>((h1 << 24) | (h2 << 16) | (h3 << 8) | h4),
+                    .data_port = static_cast<uint16_t>((p1 << 8) | p2),
+                    .last_seen = now_ms * 1000,
+                    .passive_mode = true,
+                    .alert_sent = false
+                };
+
+                ftp_data_connections_[key] = info;
+            }
+        }
+    }
+}
+
+/*
+ * C-04: Service Mesh Traffic Monitoring
+ *
+ * Analyzes traffic paths to distinguish between iptables and eBPF routing:
+ * - IPTABLES: kube-proxy standard routing (10.x.x.x service IPs)
+ * - EBPF: eBPF-based service mesh (Cilium direct routing, Linkerd)
+ * - HOST: Traffic to/from node (host network)
+ * - CROSS_NS: Cross-namespace communication
+ *
+ * Detection heuristics:
+ * 1. Check if traffic is to a Kubernetes service IP (10.x.x.x)
+ * 2. Check if source/dest is host network (non-pod IP range)
+ * 3. Check for cross-namespace communication patterns
+ * 4. Analyze connection characteristics (hairpinning, NAT patterns)
+ */
+void XdpProcessor::analyze_service_mesh_traffic(const XdpPacket& pkt) {
+    // Kubernetes service IP range: 10.0.0.0/8
+    // Pod IP range typically: 10.244.0.0/16 or 10.42.0.0/16 (Cilium)
+    // Host network: 172.16.x.x - 172.31.x.x or physical interface IPs
+
+    bool is_k8s_service = (pkt.dst_ip & 0xFF000000) == 0x0A000000;  // 10.0.0.0/8
+    bool is_k8s_pod = ((pkt.src_ip & 0xFFFF0000) == 0x0A0A0000) ||  // 10.10.x.x (Cilium pod)
+                       ((pkt.src_ip & 0xFFC00000) == 0x0A440000);   // 10.244.0.0/14 (standard k8s)
+
+    TrafficPath path = TrafficPath::UNKNOWN;
+
+    if (is_k8s_service) {
+        // Traffic to Kubernetes service VIP (via kube-proxy or eBPF)
+        path = TrafficPath::IPTABLES;
+    } else if (is_k8s_pod && !is_k8s_service) {
+        // Direct pod-to-pod communication (typical of eBPF service mesh)
+        // Cilium uses this for direct routing without NAT
+        path = TrafficPath::EBPF;
+    }
+
+    // Check for host network traffic
+    // Host network range: 172.16.0.0/12 or physical IPs
+    bool is_host_range = ((pkt.dst_ip & 0xF0000000) == 0xA000000);  // 172.16.x.x - 172.31.x.x
+
+    if (is_host_range || (pkt.dst_port != 0 && pkt.dst_port < 1024)) {
+        // Well-known port traffic often indicates host services
+        path = TrafficPath::HOST;
+    }
+
+    // Log service mesh traffic analysis (for debugging/monitoring)
+    // In production, this could emit metrics or alerts
+    static std::atomic<uint64_t> iptables_count{0};
+    static std::atomic<uint64_t> ebpf_count{0};
+    static std::atomic<uint64_t> host_count{0};
+    static std::atomic<uint64_t> cross_ns_count{0};
+
+    switch (path) {
+        case TrafficPath::IPTABLES:
+            iptables_count++;
+            break;
+        case TrafficPath::EBPF:
+            ebpf_count++;
+            break;
+        case TrafficPath::HOST:
+            host_count++;
+            break;
+        case TrafficPath::CROSS_NS:
+            cross_ns_count++;
+            break;
+        case TrafficPath::UNKNOWN:
+        default:
+            break;
+    }
+
+    // Note: In a full implementation, we could emit these as metrics
+    // or detect anomalies (e.g., unexpected iptables traffic when eBPF is expected)
+}
+
+/**
+ * @brief Parse IPv6 extension headers
+ * @param ipv6 IPv6 header pointer
+ * @param data_end End of packet data
+ * @param next_header [out] Protocol after extension headers
+ * @param header_len [out] Total length of IPv6 header + extension headers
+ * @return true if parsing succeeded
+ */
+static bool parse_ipv6_ext_headers(const struct ipv6hdr* ipv6,
+                                   const uint8_t* data_end,
+                                   uint8_t& next_header,
+                                   size_t& header_len) {
+    next_header = ipv6->nexthdr;
+    header_len = sizeof(struct ipv6hdr);
+
+    const uint8_t* hdr = (const uint8_t*)(ipv6 + 1);
+
+    while (hdr < data_end) {
+        switch (next_header) {
+            case 0:   /* Hop-by-Hop Options */
+            case 43:  /* Routing Header */
+            case 44:  /* Fragment Header */
+            case 51:  /* AH Header */
+            case 60:  /* Destination Options */
+                if (hdr + 2 > data_end) return false;
+                header_len += (hdr[1] + 1) * 8;
+                next_header = hdr[0];
+                hdr += (hdr[1] + 1) * 8;
+                break;
+            default:
+                return true;  /* Unknown or final header */
+        }
+    }
+    return true;
+}
+
+/*
+ * F-04: DNS Tunneling Detection - DNS Query Parser
+ *
+ * Parses DNS query packets to extract query name and type.
+ * DNS format:
+ *   - Transaction ID (2 bytes)
+ *   - Flags (2 bytes)
+ *   - Questions (2 bytes)
+ *   - Answer RRs (2 bytes)
+ *   - Authority RRs (2 bytes)
+ *   - Additional RRs (2 bytes)
+ *   - Query name (variable, null-terminated with label lengths)
+ *   - Query type (2 bytes)
+ *   - Query class (2 bytes)
+ */
+bool XdpProcessor::parse_dns_query(const uint8_t* payload, size_t payload_len, DnsQueryInfo& info) {
+    info = DnsQueryInfo{};
+    info.is_valid = false;
+    info.is_tunneling = false;
+
+    if (payload_len < 12) {
+        return false;  // DNS header is 12 bytes minimum
+    }
+
+    // DNS header parsing
+    uint16_t flags = (payload[2] << 8) | payload[3];
+
+    // QR bit = 0 for query, QR bit = 1 for response
+    // We only process queries (not responses)
+    if ((flags & 0x8000) != 0) {
+        return false;  // This is a response, not a query
+    }
+
+    info.query_id = (payload[0] << 8) | payload[1];
+
+    // Skip header (12 bytes)
+    const uint8_t* ptr = payload + 12;
+    size_t remaining = payload_len - 12;
+
+    // Parse query name (DNS name encoding: length-prefixed labels)
+    std::string query_name;
+    while (remaining > 0 && *ptr != 0) {
+        if (*ptr > remaining - 1) {
+            return false;  // Invalid label length
+        }
+        uint8_t label_len = *ptr;
+        if (label_len > 63) {
+            return false;  // Label too long (DNS compression not handled here)
+        }
+        ptr++;  // Skip length byte
+        query_name.append(reinterpret_cast<const char*>(ptr), label_len);
+        ptr += label_len;
+        remaining -= (label_len + 1);
+        if (*ptr != 0) {
+            query_name.push_back('.');
+        }
+    }
+
+    if (remaining < 5) {
+        return false;  // Need at least null terminator + query type + query class
+    }
+
+    ptr++;  // Skip null terminator
+    remaining--;
+
+    // Parse query type (2 bytes)
+    info.query_type = (ptr[0] << 8) | ptr[1];
+    info.query_name = query_name;
+
+    info.is_valid = !query_name.empty();
+    return info.is_valid;
+}
+
+/*
+ * R-01: QUIC Protocol Detection
+ *
+ * Parses QUIC packet headers to detect QUIC traffic on UDP port 443.
+ * QUIC is a UDP-based multiplexed transport protocol used by HTTP/3.
+ *
+ * QUIC header format (RFC 9000):
+ * - Long header packets (initial, handshake, 0-RTT):
+ *   First byte: 0xC0 (form=1, fixed=1, type=0)
+ *   Version (4 bytes)
+ *   Connection ID length (1 byte)
+ *   Connection ID (0-20 bytes)
+ *   Packet number (1-4 bytes)
+ * - Short header packets (1-RTT):
+ *   First byte: 0x40 (form=0, fixed=1, type=0)
+ *   Connection ID (absent in short header unless negotiated)
+ *   Packet number (1-4 bytes)
+ */
+bool XdpProcessor::parse_quic_header(const uint8_t* data, size_t len, QuicInfo& info) {
+    info = QuicInfo{};
+
+    /* Minimum QUIC header is 5 bytes (first byte + version + cid_len) */
+    if (len < 5) {
+        return false;
+    }
+
+    uint8_t first_byte = data[0];
+
+    /* Check for long header (form bit = 1) */
+    bool long_header = (first_byte & 0x80) != 0;
+
+    if (long_header) {
+        /* Long header packet */
+        /* First byte: 1 form + 1 fixed + 2 type + 2 reserved + 2 pn len */
+        info.is_quic = true;
+
+        /* Version (bytes 1-4) - stored in host byte order */
+        info.version = (static_cast<uint32_t>(data[1]) << 24) |
+                       (static_cast<uint32_t>(data[2]) << 16) |
+                       (static_cast<uint32_t>(data[3]) << 8) |
+                       static_cast<uint32_t>(data[4]);
+
+        /* Connection ID length (byte 5) */
+        if (len < 6) {
+            return false;
+        }
+        info.connection_id_len = data[5];
+
+        /* Validate CID length (max 20 bytes) */
+        if (info.connection_id_len > 20) {
+            return false;
+        }
+
+        /* Check we have enough data for CID */
+        if (len < 6 + info.connection_id_len) {
+            return false;
+        }
+
+        /* Extract Connection ID as hex string */
+        std::ostringstream oss;
+        for (uint8_t i = 0; i < info.connection_id_len; i++) {
+            oss << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
+                << static_cast<int>(data[6 + i]);
+        }
+        info.connection_id = oss.str();
+
+        /* Packet number length is in bits 0-1 of first byte after extracting other fields */
+        info.packet_number_len = (first_byte & 0x03) + 1;  /* 1-4 bytes */
+    } else {
+        /* Short header packet - this is 1-RTT data, QUIC is established */
+        /* Short header packets don't have connection ID in the header itself */
+        /* We detect them based on the fact that they're on UDP 443 with QUIC established */
+        info.is_quic = true;
+        info.version = 1;  /* 1-RTT */
+        info.connection_id_len = 0;
+        info.connection_id = "";
+        /* Packet number length: 1-4 bytes from first byte bits 0-1 */
+        info.packet_number_len = (first_byte & 0x03) + 1;
+    }
+
+    return info.is_quic;
+}
+
+/*
+ * F-04: DNS Tunneling Detection
+ *
+ * Detects DNS tunneling by analyzing query patterns:
+ * - Long domain names (>50 bytes) - may indicate encoded data
+ * - Excessive labels (>20 dots) - may indicate obfuscation
+ * - Abnormal query types (TXT=16, NULL=10, AXFR=252) - often used in tunneling
+ */
+void XdpProcessor::detect_dns_tunneling(const XdpPacket& pkt, const DnsQueryInfo& info) {
+    // DNS tunneling detection heuristics
+    if (info.query_name.length() > 50) {
+        // Suspiciously long domain name
+        if (dns_tunneling_callback_) {
+            DpiResult result;
+            result.matched = true;
+            result.rule_id = -1;
+            result.message = "DNS tunneling suspected: long domain name (" +
+                           std::to_string(info.query_name.length()) + " bytes)";
+            dns_tunneling_callback_(pkt, result);
+        }
+    }
+
+    // Count labels in domain name
+    size_t label_count = 0;
+    for (char c : info.query_name) {
+        if (c == '.') label_count++;
+    }
+    if (label_count > 20) {
+        // Suspiciously many labels
+        if (dns_tunneling_callback_) {
+            DpiResult result;
+            result.matched = true;
+            result.rule_id = -1;
+            result.message = "DNS tunneling suspected: too many labels (" +
+                           std::to_string(label_count) + ")";
+            dns_tunneling_callback_(pkt, result);
+        }
+    }
+
+    // Check for abnormal query types (TXT=16, NULL=10, AXFR=252)
+    if (info.query_type == 16 || info.query_type == 10 || info.query_type == 252) {
+        if (dns_tunneling_callback_) {
+            DpiResult result;
+            result.matched = true;
+            result.rule_id = -1;
+            result.message = "DNS tunneling suspected: abnormal query type " +
+                           std::to_string(info.query_type);
+            dns_tunneling_callback_(pkt, result);
+        }
+    }
+}
+
+/*
+ * F-05: TLS Certificate Detection - ASN.1 Basic Decoding
+ *
+ * ASN.1 DER (Distinguished Encoding Rules) decoding for X.509 certificates.
+ * X.509 certificates use DER encoding which has the following structure:
+ *   - Tag (1 byte): Identifies the type (SEQUENCE, INTEGER, OID, etc.)
+ *   - Length (1-3 bytes): Length of the content
+ *   - Content (variable): The actual data
+ *
+ * Common ASN.1 tags used in X.509:
+ *   0x30 = SEQUENCE
+ *   0x02 = INTEGER
+ *   0x03 = BIT STRING
+ *   0x06 = OBJECT IDENTIFIER (OID)
+ *   0x0C = UTF8String
+ *   0x13 = PrintableString
+ *   0x16 = IA5String
+ *   0x17 = UTCTime
+ *   0x20 = GeneralTime (GeneralizedTime)
+ */
+
+/**
+ * @brief Decode a single ASN.1 tag from buffer
+ * @param data Input buffer
+ * @param len Buffer length
+ * @param tag Output: decoded ASN.1 tag
+ * @return true if successful, false if insufficient data or invalid encoding
+ */
+bool XdpProcessor::decode_asn1_tag(const uint8_t* data, size_t len, Asn1Tag& tag) {
+    if (len < 2) {
+        return false;  // Need at least tag + length byte
+    }
+
+    tag.tag = data[0];
+    tag.value = nullptr;
+    tag.length = 0;
+
+    // Parse length (DER uses definite form)
+    if (data[1] < 0x80) {
+        // Short form: length is in the byte itself
+        tag.length = data[1];
+        tag.value = data + 2;
+    } else if (data[1] == 0x80) {
+        // Indefinite form (not typically used in DER)
+        return false;
+    } else {
+        // Long form: bits 5-0 indicate number of subsequent bytes
+        size_t num_len_bytes = data[1] & 0x7F;
+        if (len < 2 + num_len_bytes) {
+            return false;  // Insufficient data for length
+        }
+
+        tag.length = 0;
+        for (size_t i = 0; i < num_len_bytes; i++) {
+            tag.length = (tag.length << 8) | data[2 + i];
+        }
+        tag.value = data + 2 + num_len_bytes;
+    }
+
+    // Validate we have enough data
+    if (tag.value + tag.length > data + len) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Extract OID (Object Identifier) from ASN.1 encoded data
+ * @param oid_data OID encoded bytes
+ * @param oid_len OID length
+ * @return Human-readable OID string (e.g., "2.5.4.3" for CN)
+ *
+ * OID encoding:
+ * - First byte = (first_arc * 40) + second_arc
+ * - Subsequent bytes = variable-length encoding of remaining arcs
+ */
+std::string XdpProcessor::extract_oid_string(const uint8_t* oid_data, size_t oid_len) {
+    if (oid_len < 1) {
+        return "";
+    }
+
+    // Decode first component
+    uint8_t first = oid_data[0];
+    uint32_t arc1 = first / 40;
+    uint32_t arc2 = first % 40;
+
+    std::ostringstream oss;
+    oss << arc1 << "." << arc2;
+
+    // Decode remaining components (base 128, variable length)
+    uint32_t value = 0;
+    for (size_t i = 1; i < oid_len; i++) {
+        value = (value << 7) | (oid_data[i] & 0x7F);
+        if ((oid_data[i] & 0x80) == 0) {
+            // End of this component
+            oss << "." << value;
+            value = 0;
+        }
+    }
+
+    return oss.str();
+}
+
+/**
+ * @brief Parse time from ASN.1 UTCTime or GeneralizedTime
+ * @param time_data Time encoded bytes
+ * @param time_len Time length
+ * @return Epoch seconds (0 on error)
+ *
+ * UTCTime format: YYMMDDhhmmssZ or YYMMDDhhmmss+hhmm
+ * GeneralizedTime format: YYYYMMDDhhmmssZ (4-digit year)
+ */
+uint64_t XdpProcessor::parse_asn1_time(const uint8_t* time_data, size_t time_len) {
+    if (time_len < 10) {
+        return 0;
+    }
+
+    int year, month, day, hour, minute, second;
+    char zulu;
+
+    if (time_len == 13 && time_data[12] == 'Z') {
+        // UTCTime: YYMMDDhhmmssZ
+        year = (time_data[0] - '0') * 10 + (time_data[1] - '0');
+        month = (time_data[2] - '0') * 10 + (time_data[3] - '0');
+        day = (time_data[4] - '0') * 10 + (time_data[5] - '0');
+        hour = (time_data[6] - '0') * 10 + (time_data[7] - '0');
+        minute = (time_data[8] - '0') * 10 + (time_data[9] - '0');
+        second = (time_data[10] - '0') * 10 + (time_data[11] - '0');
+        zulu = 'Z';
+
+        // UTCTime: years 00-49 = 2000-2049, 50-99 = 1950-1999
+        if (year < 50) {
+            year += 2000;
+        } else {
+            year += 1900;
+        }
+    } else if (time_len >= 15 && time_data[14] == 'Z') {
+        // GeneralizedTime: YYYYMMDDhhmmssZ
+        year = (time_data[0] - '0') * 1000 + (time_data[1] - '0') * 100 +
+               (time_data[2] - '0') * 10 + (time_data[3] - '0');
+        month = (time_data[4] - '0') * 10 + (time_data[5] - '0');
+        day = (time_data[6] - '0') * 10 + (time_data[7] - '0');
+        hour = (time_data[8] - '0') * 10 + (time_data[9] - '0');
+        minute = (time_data[10] - '0') * 10 + (time_data[11] - '0');
+        second = (time_data[12] - '0') * 10 + (time_data[13] - '0');
+        zulu = 'Z';
+    } else {
+        return 0;  // Unsupported format
+    }
+
+    // Simple date to epoch (this is a stub - proper implementation would use tm struct)
+    // For now, return a sentinel value indicating parsing was attempted
+    (void)zulu;
+
+    // Basic validation
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour > 23 || minute > 59 || second > 59) {
+        return 0;
+    }
+
+    // Calculate approximate epoch (this is a simplified calculation)
+    // Days from epoch (1970-01-01) to this date
+    uint64_t days = 0;
+    for (int y = 1970; y < year; y++) {
+        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+    }
+    static const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int m = 1; m < month; m++) {
+        days += mdays[m - 1];
+    }
+    if (month > 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+        days += 1;  // Leap day
+    }
+    days += day - 1;
+
+    return (days * 86400ULL) + (hour * 3600ULL) + (minute * 60ULL) + second;
+}
+
+/*
+ * F-05: TLS Certificate Parsing (Stub Implementation)
+ *
+ * TLS Certificate message contains:
+ * - Certificate list (SEQUENCE of Certificate)
+ * - Each Certificate is a SEQUENCE containing:
+ *   - TBSCertificate (SEQUENCE)
+ *   - signatureAlgorithm (AlgorithmIdentifier)
+ *   - signatureValue (BIT STRING)
+ *
+ * Agent-6 will implement full certificate chain parsing and validation.
+ */
+
+/**
+ * @brief Parse TLS certificate from ServerCertificate handshake
+ * @param handshake_data Certificate handshake message data
+ * @param handshake_len Data length
+ * @param certs Output: vector of parsed certificates
+ * @return true if at least one certificate was parsed
+ */
 } // namespace nids

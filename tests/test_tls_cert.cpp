@@ -156,9 +156,9 @@ protected:
 
         /* Signature Algorithm (SEQUENCE) - SHA256 with RSA */
         tbs.push_back(0x30);
-        tbs.push_back(0x0D);
+        tbs.push_back(0x0D);  /* Length: 13 bytes content */
         tbs.push_back(0x06);
-        tbs.push_back(0x09);
+        tbs.push_back(0x09);  /* OID: 1.2.840.113549.1.1.11 */
         tbs.push_back(0x2A);
         tbs.push_back(0x86);
         tbs.push_back(0x48);
@@ -166,7 +166,8 @@ protected:
         tbs.push_back(0xF7);
         tbs.push_back(0x0D);
         tbs.push_back(0x02);
-        tbs.push_back(0x09);  /* SHA-256 */
+        tbs.push_back(0x01);
+        tbs.push_back(0x0B);
         tbs.push_back(0x05);
         tbs.push_back(0x00);
 
@@ -184,7 +185,7 @@ protected:
 
         /* Subject Public Key Info (SEQUENCE) - minimal RSA key */
         std::vector<uint8_t> spki = {
-            0x30, 0x0D,  /* SEQUENCE */
+            0x30, 0x12,  /* SEQUENCE - 18 bytes content */
             0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,  /* RSA OID */
             0x05, 0x00,  /* NULL */
             0x03, 0x03, 0x01, 0x00, 0x01  /* BIT STRING */
@@ -208,9 +209,14 @@ protected:
         } else if (tbs.size() < 256) {
             tbs_wrapped.push_back(0x81);
             tbs_wrapped.push_back(static_cast<uint8_t>(tbs.size()));
-        } else {
+        } else if (tbs.size() < 65536) {
             tbs_wrapped.push_back(0x82);
             tbs_wrapped.push_back(static_cast<uint8_t>(tbs.size() >> 8));
+            tbs_wrapped.push_back(static_cast<uint8_t>(tbs.size() & 0xFF));
+        } else {
+            tbs_wrapped.push_back(0x83);
+            tbs_wrapped.push_back(static_cast<uint8_t>(tbs.size() >> 16));
+            tbs_wrapped.push_back(static_cast<uint8_t>((tbs.size() >> 8) & 0xFF));
             tbs_wrapped.push_back(static_cast<uint8_t>(tbs.size() & 0xFF));
         }
         tbs_wrapped.insert(tbs_wrapped.end(), tbs.begin(), tbs.end());
@@ -218,7 +224,7 @@ protected:
         /* Signature Algorithm (same as above) */
         std::vector<uint8_t> sigAlgo = {
             0x30, 0x0D,
-            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x09,
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x01, 0x0B,
             0x05, 0x00
         };
 
@@ -240,13 +246,22 @@ protected:
         std::vector<uint8_t> outer;
         outer.push_back(0x30);
         if (cert.size() < 128) {
+            /* Short form: 0x00-0x7F */
             outer.push_back(static_cast<uint8_t>(cert.size()));
         } else if (cert.size() < 256) {
+            /* Long form with 1 length byte: 0x80-0xFF */
             outer.push_back(0x81);
             outer.push_back(static_cast<uint8_t>(cert.size()));
-        } else {
+        } else if (cert.size() < 65536) {
+            /* Long form with 2 length bytes: 0x0100-0xFFFF */
             outer.push_back(0x82);
             outer.push_back(static_cast<uint8_t>(cert.size() >> 8));
+            outer.push_back(static_cast<uint8_t>(cert.size() & 0xFF));
+        } else {
+            /* Long form with 3 length bytes */
+            outer.push_back(0x83);
+            outer.push_back(static_cast<uint8_t>(cert.size() >> 16));
+            outer.push_back(static_cast<uint8_t>((cert.size() >> 8) & 0xFF));
             outer.push_back(static_cast<uint8_t>(cert.size() & 0xFF));
         }
         outer.insert(outer.end(), cert.begin(), cert.end());
@@ -261,13 +276,19 @@ protected:
         std::vector<uint8_t> rdn;
 
         /* CN AttributeTypeAndValue: SEQUENCE { OID, PrintableString } */
+        std::vector<uint8_t> atv_content;
+        atv_content.push_back(0x06);  /* OID tag */
+        atv_content.push_back(0x03);  /* Length 3 */
+        atv_content.insert(atv_content.end(), OID_CN, OID_CN + 3);
+        atv_content.push_back(0x13);  /* PrintableString tag */
+        atv_content.push_back(static_cast<uint8_t>(cn.size()));
+        atv_content.insert(atv_content.end(), cn.begin(), cn.end());
+
+        /* Wrap AT/V content in SEQUENCE */
         std::vector<uint8_t> atv;
-        atv.push_back(0x06);  /* OID tag */
-        atv.push_back(0x03);  /* Length 3 */
-        atv.insert(atv.end(), OID_CN, OID_CN + 3);
-        atv.push_back(0x13);  /* PrintableString tag */
-        atv.push_back(static_cast<uint8_t>(cn.size()));
-        atv.insert(atv.end(), cn.begin(), cn.end());
+        atv.push_back(0x30);  /* SEQUENCE tag */
+        atv.push_back(static_cast<uint8_t>(atv_content.size()));
+        atv.insert(atv.end(), atv_content.begin(), atv_content.end());
 
         /* Wrap in SET */
         std::vector<uint8_t> set;
@@ -275,7 +296,7 @@ protected:
         set.push_back(static_cast<uint8_t>(atv.size()));
         set.insert(set.end(), atv.begin(), atv.end());
 
-        /* Wrap in SEQUENCE */
+        /* Wrap in SEQUENCE - set.size() is correct because it includes SET tag+length+content */
         rdn.push_back(0x30);  /* SEQUENCE tag */
         rdn.push_back(static_cast<uint8_t>(set.size()));
         rdn.insert(rdn.end(), set.begin(), set.end());
@@ -297,7 +318,7 @@ protected:
         std::vector<uint8_t> after = format_utctime(not_after);
         validity.insert(validity.end(), after.begin(), after.end());
 
-        /* Wrap in SEQUENCE */
+        /* Wrap in SEQUENCE - validity.size() is correct because it includes both UTCTimes fully */
         std::vector<uint8_t> seq;
         seq.push_back(0x30);
         seq.push_back(static_cast<uint8_t>(validity.size()));

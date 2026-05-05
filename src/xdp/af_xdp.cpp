@@ -1198,23 +1198,28 @@ bool XdpProcessor::parse_x509_certificate(const uint8_t* cert_data,
 
     const uint8_t* ptr = cert_data;
     size_t remaining = cert_len;
+    fprintf(stderr, "DEBUG: cert_len=%zu\n", cert_len);
 
     /* Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature } */
     uint8_t tag;
     uint32_t len;
     ptr = asn1_read_tlv(ptr, remaining, tag, len);
     if (!ptr || tag != 0x30) {  /* SEQUENCE */
+        fprintf(stderr, "DEBUG: failed at outer SEQUENCE\n");
         return false;
     }
     remaining = len;
+    fprintf(stderr, "DEBUG: outer len=%u\n", len);
 
     /* TBSCertificate ::= SEQUENCE { ... } */
     const uint8_t* tbs_ptr = ptr;
     ptr = asn1_read_tlv(ptr, remaining, tag, len);
     if (!ptr || tag != 0x30) {
+        fprintf(stderr, "DEBUG: failed at TBS SEQUENCE\n");
         return false;
     }
     size_t tbs_len = len;
+    fprintf(stderr, "DEBUG: TBS len=%zu\n", tbs_len);
 
     /* Parse TBSCertificate fields */
     size_t pos = 0;
@@ -1229,24 +1234,35 @@ bool XdpProcessor::parse_x509_certificate(const uint8_t* cert_data,
             pos = vptr - tbs_start + vlen;
         }
     }
+    fprintf(stderr, "DEBUG: after version, pos=%zu, byte=0x%02X\n", pos, ptr[pos]);
 
     /* serialNumber (INTEGER) */
     uint8_t serial_tag;
     uint32_t serial_len;
     const uint8_t* serial_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, serial_tag, serial_len);
     if (!serial_ptr || serial_tag != 0x02) {
+        fprintf(stderr, "DEBUG: failed at serial (tag=0x%02X)\n", serial_tag);
         return false;
     }
-    pos += serial_ptr - (ptr + pos) + serial_len;
+    fprintf(stderr, "DEBUG: serial OK, pos=%zu\n", pos);
+    /* Advance past the INTEGER TLV: 2 bytes for tag+length, plus the value */
+    pos += 2 + serial_len;
+    if (pos > tbs_len) return false;
+    fprintf(stderr, "DEBUG: after serial, pos=%zu, byte=0x%02X\n", pos, ptr[pos]);
 
     /* signatureAlgorithm (SEQUENCE) */
     uint8_t sig_tag;
     uint32_t sig_len;
     const uint8_t* sig_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, sig_tag, sig_len);
     if (!sig_ptr || sig_tag != 0x30) {
+        fprintf(stderr, "DEBUG: failed at sigalgo (tag=0x%02X)\n", sig_tag);
         return false;
     }
-    pos += sig_ptr - (ptr + pos) + sig_len;
+    fprintf(stderr, "DEBUG: sigalgo OK, sig_len=%u, pos=%zu\n", sig_len, pos);
+    /* Advance past the SEQUENCE TLV: 2 bytes for tag+length, plus the value */
+    pos += 2 + sig_len;
+    if (pos > tbs_len) return false;
+    fprintf(stderr, "DEBUG: after sigalgo, pos=%zu, byte=0x%02X\n", pos, ptr[pos]);
 
     /* Check for weak hash algorithm in signature OID */
     uint8_t oid_tag;
@@ -1263,38 +1279,49 @@ bool XdpProcessor::parse_x509_certificate(const uint8_t* cert_data,
     uint8_t issuer_tag;
     uint32_t issuer_len;
     const uint8_t* issuer_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, issuer_tag, issuer_len);
+    fprintf(stderr, "DEBUG: issuer at pos=%zu, byte=0x%02X, tbs_len-pos=%zu\n", pos, ptr[pos], tbs_len - pos);
     if (!issuer_ptr || issuer_tag != 0x30) {
+        fprintf(stderr, "DEBUG: failed at issuer (tag=0x%02X)\n", issuer_tag);
         return false;
     }
-    cert.issuer = nids::parse_x509_name(issuer_ptr, issuer_len);
+    fprintf(stderr, "DEBUG: issuer OK, issuer_len=%u\n", issuer_len);
+    /* asn1_read_tlv returns pointer to content, but parse_x509_name expects full TLV */
+    cert.issuer = nids::parse_x509_name(ptr + pos, issuer_len + 2);
+    fprintf(stderr, "DEBUG: issuer parsed: '%s'\n", cert.issuer.c_str());
     pos += issuer_ptr - (ptr + pos) + issuer_len;
 
     /* validity (SEQUENCE) */
     uint8_t validity_tag;
     uint32_t validity_len;
     const uint8_t* validity_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, validity_tag, validity_len);
+    fprintf(stderr, "DEBUG: validity at pos=%zu, byte=0x%02X\n", pos, ptr[pos]);
     if (!validity_ptr || validity_tag != 0x30) {
+        fprintf(stderr, "DEBUG: failed at validity (tag=0x%02X)\n", validity_tag);
         return false;
     }
+    fprintf(stderr, "DEBUG: validity OK, validity_len=%u\n", validity_len);
     /* Parse UTCTime notBefore and notAfter */
     const uint8_t* vptr = validity_ptr;
     size_t vremaining = validity_len;
-    while (vremaining > 0) {
+    while (vremaining >= 2) {  /* Need at least 2 bytes for tag + length */
         uint8_t time_tag;
         uint32_t time_len;
         vptr = asn1_read_tlv(vptr, vremaining, time_tag, time_len);
         if (!vptr) break;
+        fprintf(stderr, "DEBUG: UTCTime tag=0x%02X len=%u\n", time_tag, time_len);
         if (time_tag == 0x17) {  /* UTCTime */
             uint64_t time_val = asn1_parse_utctime(vptr, time_len);
+            fprintf(stderr, "DEBUG: parsed time=%lu\n", time_val);
             if (cert.not_before == 0) {
                 cert.not_before = time_val;
             } else {
                 cert.not_after = time_val;
             }
         }
-        vremaining = validity_len - (vptr - validity_ptr + time_len);
-        if (vremaining >= validity_len) break;
+        /* Advance past this UTCTime's content - asn1_read_tlv already advanced past header */
         vptr += time_len;
+        vremaining -= (2 + time_len);  /* 2 for tag+length, time_len for content */
+        if (vptr >= validity_ptr + validity_len) break;
     }
     pos += validity_ptr - (ptr + pos) + validity_len;
 
@@ -1302,10 +1329,14 @@ bool XdpProcessor::parse_x509_certificate(const uint8_t* cert_data,
     uint8_t subject_tag;
     uint32_t subject_len;
     const uint8_t* subject_ptr = asn1_read_tlv(ptr + pos, tbs_len - pos, subject_tag, subject_len);
+    fprintf(stderr, "DEBUG: subject at pos=%zu, byte=0x%02X\n", pos, ptr[pos]);
     if (!subject_ptr || subject_tag != 0x30) {
+        fprintf(stderr, "DEBUG: failed at subject (tag=0x%02X)\n", subject_tag);
         return false;
     }
-    cert.subject = nids::parse_x509_name(subject_ptr, subject_len);
+    fprintf(stderr, "DEBUG: subject OK\n");
+    /* asn1_read_tlv returns pointer to content, but parse_x509_name expects full TLV */
+    cert.subject = nids::parse_x509_name(ptr + pos, subject_len + 2);
     cert.common_name = nids::extract_cn(cert.subject);
     pos += subject_ptr - (ptr + pos) + subject_len;
 
@@ -1428,60 +1459,77 @@ bool XdpProcessor::parse_x509_certificate(const uint8_t* cert_data,
 std::string parse_x509_name(const uint8_t* data, size_t len) {
     std::string result;
     const uint8_t* ptr = data;
-    size_t remaining = len;
+    size_t pos = 0;
 
     /* Name ::= RDNSequence */
     /* RDNSequence ::= SEQUENCE OF RelativeDistinguishedName */
     /* RelativeDistinguishedName ::= SET OF AttributeTypeAndValue */
     /* AttributeTypeAndValue ::= SEQUENCE { type, value } */
 
-    while (remaining > 0) {
-        uint8_t tag;
-        uint32_t len_val;
-        ptr = asn1_read_tlv(ptr, remaining, tag, len_val);
-        if (!ptr) break;
+    while (pos < len) {
+        /* Read RDN SEQUENCE */
+        uint8_t rdn_tag = ptr[pos];
+        if (rdn_tag != 0x30) break;
+        uint32_t rdn_content_len;
+        const uint8_t* rdn_content = asn1_read_tlv(ptr + pos, len - pos, rdn_tag, rdn_content_len);
+        if (!rdn_content) break;
 
-        if (tag == 0x30) {  /* SEQUENCE - RDN */
-            const uint8_t* rdn_ptr = ptr;
-            size_t rdn_len = len_val;
-            while (rdn_len > 0) {
-                uint8_t set_tag;
-                uint32_t set_len;
-                rdn_ptr = asn1_read_tlv(rdn_ptr, rdn_len, set_tag, set_len);
-                if (!rdn_ptr) break;
+        size_t rdn_end = pos + 2 + rdn_content_len;  /* After RDN SEQUENCE */
 
-                if (set_tag == 0x31) {  /* SET - AttributeTypeAndValue */
-                    uint8_t type_tag, value_tag;
-                    uint32_t type_len, value_len;
-                    const uint8_t* type_ptr = asn1_read_tlv(rdn_ptr, set_len, type_tag, type_len);
-                    if (!type_ptr) break;
+        /* Parse SETs within the RDN */
+        size_t set_pos = 0;
+        while (set_pos < rdn_content_len) {
+            /* Read SET */
+            uint8_t set_tag = rdn_content[set_pos];
+            if (set_tag != 0x31) break;
+            uint32_t set_content_len;
+            const uint8_t* set_content = asn1_read_tlv(rdn_content + set_pos, rdn_content_len - set_pos, set_tag, set_content_len);
+            if (!set_content) break;
 
-                    const uint8_t* value_ptr = asn1_read_tlv(type_ptr + type_len, set_len - (type_ptr - rdn_ptr + type_len), value_tag, value_len);
-                    if (!value_ptr) {
-                        rdn_ptr += set_len;
-                        rdn_len -= rdn_ptr - (ptr + len_val - remaining);
-                        continue;
-                    }
+            /* Parse AT/V within SET */
+            size_t atv_pos = 0;
+            while (atv_pos < set_content_len) {
+                /* Read AT/V SEQUENCE */
+                uint8_t atv_tag = set_content[atv_pos];
+                if (atv_tag != 0x30) break;
+                uint32_t atv_content_len;
+                const uint8_t* atv_content = asn1_read_tlv(set_content + atv_pos, set_content_len - atv_pos, atv_tag, atv_content_len);
+                if (!atv_content) break;
 
-                    /* Check for CN (2.5.4.3) */
-                    if (type_tag == 0x06 && type_len == sizeof(OID_CN) &&
-                        std::memcmp(type_ptr, OID_CN, sizeof(OID_CN)) == 0) {
-                        std::string cn = asn1_read_string(value_ptr, value_len, value_tag);
-                        if (!cn.empty()) {
-                            if (!result.empty()) result += ", ";
-                            result += cn;
-                        }
+                /* Parse type OID */
+                size_t type_pos = 0;
+                if (atv_content[type_pos] != 0x06) {
+                    atv_pos += 2 + atv_content_len;
+                    continue;
+                }
+                uint32_t oid_len = atv_content[type_pos + 1];
+                type_pos += 2 + oid_len;
+
+                if (type_pos >= atv_content_len) break;
+
+                /* Parse string value */
+                uint8_t value_tag = atv_content[type_pos];
+                uint32_t value_len = atv_content[type_pos + 1];
+
+                /* Check for CN (2.5.4.3) - OID 55 04 03 */
+                bool is_cn = (oid_len == 3 &&
+                    atv_content[2] == 0x55 && atv_content[3] == 0x04 && atv_content[4] == 0x03);
+
+                if (is_cn && value_tag == 0x13) {  /* PrintableString */
+                    std::string cn((char*)&atv_content[type_pos + 2], value_len);
+                    if (!cn.empty()) {
+                        if (!result.empty()) result += ", ";
+                        result += cn;
                     }
                 }
-                rdn_ptr += set_len;
-                rdn_len -= rdn_ptr - (ptr + len_val - remaining);
+
+                atv_pos += 2 + atv_content_len;
             }
+
+            set_pos += 2 + set_content_len;
         }
 
-        remaining -= len_val + (ptr - data - (len - remaining));
-        ptr += len_val;
-        remaining = len - (ptr - data);
-        if (remaining >= len) break;
+        pos = rdn_end;
     }
 
     return result;
